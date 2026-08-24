@@ -1,0 +1,14 @@
+node_modules/
+dist/
+build/
+coverage/
+
+# secrets — bot token, client secret, signing keys
+.env
+.env.*
+!.env.example
+*.pem
+
+*.log
+.DS_Store
+Thumbs.db
