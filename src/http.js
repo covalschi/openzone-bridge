@@ -9,7 +9,14 @@
 // /v1/poll is a LONG poll. The game has no inbound connections — a DayZ server
 // listens to nobody, and Discord cannot knock on its door. So the game asks,
 // and we hold the answer until there is something to say or the hold expires.
-// DayZ's read timeout goes up to 120 s, which makes this behave like a push.
+//
+// The hold MUST stay under ten seconds. Measured against the engine: an
+// asynchronous DayZ request dies at exactly 10 s no matter what
+// RestApi.SetOption is told, and the answer then lands in a socket nobody is
+// listening on. The documented 3..120 s range applies to the synchronous call
+// only. Eight seconds leaves margin and costs one request per server per eight
+// seconds — while a message that actually arrives still goes out at once,
+// because wake() releases the held poll immediately.
 
 import { createServer } from 'node:http';
 
@@ -45,6 +52,13 @@ export class HttpSide {
   async #route(req, res) {
     if (req.method === 'GET' && req.url.startsWith('/oauth/callback')) {
       return this.handlers.oauthCallback(req, res);
+    }
+
+    // Reachability check, and nothing else: no secret, no state, no answer
+    // that says anything about the guild. Setting a bridge up means proving
+    // the game can reach it before wondering why chat is empty.
+    if (req.url.startsWith('/v1/ping')) {
+      return this.#json(res, 200, { ok: true });
     }
 
     if (req.method !== 'POST') {

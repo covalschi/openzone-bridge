@@ -36,7 +36,8 @@ const cfg = {
   redirectUrl: need('OAUTH_REDIRECT_URL'),
   port: Number(process.env.BRIDGE_PORT || 8787),
   secret: need('OZ_SHARED_SECRET'),
-  holdSeconds: Number(process.env.POLL_HOLD_SECONDS || 25),
+  // Under ten: see the note in http.js -- the game's request dies at 10 s.
+  holdSeconds: Number(process.env.POLL_HOLD_SECONDS || 8),
   statePath: process.env.BRIDGE_STATE || './state/bridge.json',
 };
 
@@ -96,7 +97,7 @@ const routes = {
   '/v1/chat/open': async ({ Json }) => {
     const { Uid: uid, Id: key, Limit: limit } = Json;
     const c = store.convo(key);
-    if (!c || !c.members.includes(uid)) return { Error: 'no such conversation' };
+    if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
 
     return {
       Id: key,
@@ -131,9 +132,9 @@ const routes = {
   '/v1/chat/group_add': async ({ Json }) => {
     const { Uid: uid, Id: key, OtherUid: otherUid } = Json;
     const c = store.convo(key);
-    if (!c || !c.members.includes(uid)) return { Error: 'no such conversation' };
-    if (c.kind !== 'group') return { Error: 'not a group' };
-    if (c.members.includes(otherUid)) return { Error: 'already in' };
+    if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
+    if (c.kind !== 'group') return { Error: 'not_group' };
+    if (c.members.includes(otherUid)) return { Error: 'already_in' };
 
     c.members.push(otherUid);
     store.putConvo(key, c);
@@ -144,7 +145,7 @@ const routes = {
   '/v1/chat/send': async ({ Json }) => {
     const { Uid: uid, Name: name, Id: key, Text: text } = Json;
     const c = store.convo(key);
-    if (!c || !c.members.includes(uid)) return { Error: 'no such conversation' };
+    if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
 
     // Sent, not stored. It becomes part of the conversation when Discord
     // hands it back over the gateway — that is what "Discord is the truth"
