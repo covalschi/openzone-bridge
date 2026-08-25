@@ -12,3 +12,5 @@ coverage/
 *.log
 .DS_Store
 Thumbs.db
+state/
+node_modules/

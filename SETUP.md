@@ -39,9 +39,31 @@ Then **Reset Token** and copy it. This IS secret.
 - Scopes: `bot`, `applications.commands`
 - Bot permissions: *View Channels*, *Send Messages*, *Create Private Threads*,
   *Send Messages in Threads*, *Manage Threads*, *Read Message History*,
-  *Manage Roles*
+  *Manage Roles*, **Manage Webhooks**
 
 Open the generated URL, pick your test guild, authorise.
+
+Or skip the generator — this is the same set as a number:
+
+```
+https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&scope=bot%20applications.commands&permissions=361582627840
+```
+
+### Why Manage Webhooks
+
+Without it the bot can still carry every message, but it posts them all as
+itself, with the speaker's name in bold in front of the line. With it, each
+stalker appears in the thread under their own in-game name. The bridge starts
+either way and says in its first line which of the two it got.
+
+**Already invited the bot without it?** No need to re-invite. Either:
+
+- *Server Settings → Roles → (the bot's role) → Permissions →* turn on
+  **Manage Webhooks**; or
+- right-click the parent channel *→ Edit Channel → Permissions →* add the bot's
+  role and turn on **Manage Webhooks** there — narrower, and enough.
+
+Restart the bridge afterwards; it decides once, at start-up.
 
 ### The trap
 
