@@ -79,11 +79,11 @@ const routes = {
   // --- chat ---
 
   '/v1/chat/list': async ({ Json }) => {
-    const { uid } = Json;
+    const { Uid: uid } = Json;
     const items = store.convosOf(uid).map((c) => {
       const tail = store.messagesOf(c.key, 1)[0];
       return {
-        Key: c.key,
+        Id: c.key,
         Kind: c.kind,
         Title: c.title,
         LastAt: tail?.at || '',
@@ -94,12 +94,12 @@ const routes = {
   },
 
   '/v1/chat/open': async ({ Json }) => {
-    const { uid, key, limit } = Json;
+    const { Uid: uid, Id: key, Limit: limit } = Json;
     const c = store.convo(key);
     if (!c || !c.members.includes(uid)) return { Error: 'no such conversation' };
 
     return {
-      Key: key,
+      Id: key,
       Kind: c.kind,
       Title: c.title,
       Members: c.members.map((m) => store.linkOf(m)?.discordName || m),
@@ -113,23 +113,23 @@ const routes = {
   },
 
   '/v1/chat/start': async ({ Json }) => {
-    const { uid, name, otherUid, otherName } = Json;
+    const { Uid: uid, Name: name, OtherUid: otherUid, OtherName: otherName } = Json;
     const key = Store.directKey(uid, otherUid);
     const c = store.convo(key);
-    if (c) return { Key: key };
+    if (c) return { Id: key };
     await startConversation(key, 'direct', `${name} & ${otherName}`, [uid, otherUid]);
-    return { Key: key };
+    return { Id: key };
   },
 
   '/v1/chat/group_new': async ({ Json }) => {
-    const { uid, title } = Json;
+    const { Uid: uid, Title: title } = Json;
     const key = `g:${uid}:${Date.now().toString(36)}`;
     await startConversation(key, 'group', title || 'group', [uid]);
-    return { Key: key };
+    return { Id: key };
   },
 
   '/v1/chat/group_add': async ({ Json }) => {
-    const { uid, key, otherUid } = Json;
+    const { Uid: uid, Id: key, OtherUid: otherUid } = Json;
     const c = store.convo(key);
     if (!c || !c.members.includes(uid)) return { Error: 'no such conversation' };
     if (c.kind !== 'group') return { Error: 'not a group' };
@@ -142,7 +142,7 @@ const routes = {
   },
 
   '/v1/chat/send': async ({ Json }) => {
-    const { uid, name, key, text } = Json;
+    const { Uid: uid, Name: name, Id: key, Text: text } = Json;
     const c = store.convo(key);
     if (!c || !c.members.includes(uid)) return { Error: 'no such conversation' };
 
@@ -155,10 +155,10 @@ const routes = {
 
   // --- account link ---
 
-  '/v1/link/begin': async ({ Json }) => ({ Url: oauth.begin(Json.uid) }),
+  '/v1/link/begin': async ({ Json }) => ({ Url: oauth.begin(Json.Uid) }),
 
   '/v1/link/status': async ({ Json }) => {
-    const l = store.linkOf(Json.uid);
+    const l = store.linkOf(Json.Uid);
     return { Linked: !!l, DiscordName: l?.discordName || '' };
   },
 };
@@ -175,7 +175,7 @@ function drain({ ServerId, Cursor, Uids }) {
         Kind: 'chat',
         Json: JSON.stringify({
           Uid: uid,
-          Key: m.key,
+          Id: m.key,
           At: m.at,
           Who: m.who,
           Text: m.text,

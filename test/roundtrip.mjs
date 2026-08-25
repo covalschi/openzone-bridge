@@ -35,19 +35,19 @@ function ok(label, cond, detail = '') {
 
 console.log('--- start a direct conversation ---');
 const started = await call('/v1/chat/start', {
-  uid: A.uid, name: A.name, otherUid: B.uid, otherName: B.name,
+  Uid: A.uid, Name: A.name, OtherUid: B.uid, OtherName: B.name,
 });
-ok('thread created', !!started.Key, started.Key);
-const key = started.Key;
+ok('thread created', !!started.Id, started.Id);
+const key = started.Id;
 
 console.log('--- both sides see it in their list ---');
-const listA = await call('/v1/chat/list', { uid: A.uid });
-const listB = await call('/v1/chat/list', { uid: B.uid });
-ok('A sees the conversation', listA.Items.some((i) => i.Key === key));
-ok('B sees the same one', listB.Items.some((i) => i.Key === key));
+const listA = await call('/v1/chat/list', { Uid: A.uid });
+const listB = await call('/v1/chat/list', { Uid: B.uid });
+ok('A sees the conversation', listA.Items.some((i) => i.Id === key));
+ok('B sees the same one', listB.Items.some((i) => i.Id === key));
 
 console.log('--- send from the game ---');
-await call('/v1/chat/send', { uid: A.uid, name: A.name, key, text: 'Проверка связи. Как слышно?' });
+await call('/v1/chat/send', { Uid: A.uid, Name: A.name, Id: key, Text: 'Проверка связи. Как слышно?' });
 
 console.log('--- poll: the message arrives only once Discord has it ---');
 const t0 = Date.now();
@@ -67,33 +67,33 @@ ok('A sees it as their own', mineForA?.Mine === true);
 ok('the speaker kept their name', mineForA?.Who === A.name, mineForA?.Who);
 
 console.log('--- read the thread back ---');
-const open = await call('/v1/chat/open', { uid: B.uid, key, limit: 20 });
-ok('B can open it', open.Key === key, open.Title);
+const open = await call('/v1/chat/open', { Uid: B.uid, Id: key, Limit: 20 });
+ok('B can open it', open.Id === key, open.Title);
 ok('the line is in the history', open.Lines.some((l) => l.Text.includes('Как слышно')));
 ok('and is NOT B own', open.Lines.at(-1)?.Mine === false);
 
 console.log('--- a stranger cannot open it ---');
-const stranger = await call('/v1/chat/open', { uid: '76561100000000009', key, limit: 5 });
+const stranger = await call('/v1/chat/open', { Uid: '76561100000000009', Id: key, Limit: 5 });
 ok('refused', !!stranger.Error, stranger.Error);
 
 console.log('--- group ---');
-const grp = await call('/v1/chat/group_new', { uid: A.uid, title: 'Свалка' });
-ok('group created', !!grp.Key, grp.Key);
-const add = await call('/v1/chat/group_add', { uid: A.uid, key: grp.Key, otherUid: B.uid });
+const grp = await call('/v1/chat/group_new', { Uid: A.uid, Title: 'Свалка' });
+ok('group created', !!grp.Id, grp.Id);
+const add = await call('/v1/chat/group_add', { Uid: A.uid, Id: grp.Id, OtherUid: B.uid });
 ok('B invited', add.ok === true);
-const grpOpen = await call('/v1/chat/open', { uid: B.uid, key: grp.Key });
-ok('B can open the group', grpOpen.Key === grp.Key, grpOpen.Title);
+const grpOpen = await call('/v1/chat/open', { Uid: B.uid, Id: grp.Id });
+ok('B can open the group', grpOpen.Id === grp.Id, grpOpen.Title);
 
 console.log('--- link status of an unlinked player ---');
-const st = await call('/v1/link/status', { uid: A.uid });
+const st = await call('/v1/link/status', { Uid: A.uid });
 ok('not linked yet', st.Linked === false);
-const begin = await call('/v1/link/begin', { uid: A.uid });
+const begin = await call('/v1/link/begin', { Uid: A.uid });
 ok('link url issued', begin.Url.startsWith('https://discord.com/api/oauth2/authorize'));
 
 console.log('--- a wrong secret is refused ---');
 const bad = await fetch(BASE + '/v1/chat/list', {
   method: 'POST',
   headers: { 'content-type': 'application/json' },
-  body: JSON.stringify({ Secret: 'nope', ServerId: SERVER, Json: { uid: A.uid } }),
+  body: JSON.stringify({ Secret: 'nope', ServerId: SERVER, Json: { Uid: A.uid } }),
 });
 ok('403', bad.status === 403);

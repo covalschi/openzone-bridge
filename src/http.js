@@ -64,6 +64,18 @@ export class HttpSide {
       return this.#json(res, 403, { error: 'refused' });
     }
 
+    // Enforce Script serialises a class field by field, and a nested object
+    // would need a declared type for every route. The game therefore posts
+    // its payload as a STRING of JSON and the bridge opens it here -- once,
+    // in one place, instead of in each route.
+    if (typeof body.Json === 'string') {
+      try {
+        body.Json = JSON.parse(body.Json || '{}');
+      } catch {
+        return this.#json(res, 400, { error: 'Json is not json' });
+      }
+    }
+
     const path = req.url.split('?')[0];
 
     try {
