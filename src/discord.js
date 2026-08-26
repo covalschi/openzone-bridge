@@ -49,12 +49,55 @@ export class DiscordSide {
     });
 
     this.client.on('messageCreate', (m) => this.#incoming(m));
-    this.client.on('interactionCreate', (i) => this.#interaction(i));
+
+    // МЕЖА ПОМИЛОК, і вона тут не про охайність.
+    //
+    // EventEmitter викидає повернуту обіцянку. Під Node 20 нерозглянута
+    // відмова -- це смерть процесу, а цей процес обслуговує не лише чат: на
+    // ньому висить восьмисекундний опит ігрового сервера. Одна відхилена
+    // відповідь -- і в грі зникають чат, реєстр і ролі.
+    //
+    // Найімовірніший шлях навіть не екзотичний: store.save() синхронно
+    // переписує весь документ на КОЖНЕ повідомлення, і на людній гільдії
+    // цикл подій легко перестрибує тривисекундне вікно Discord. Тоді
+    // i.reply() відмовляє з 10062 Unknown interaction -- і забирає з собою
+    // все інше.
+    this.client.on('interactionCreate', (i) => {
+      this.#interaction(i).catch((e) => {
+        console.warn(`[discord] interaction failed (${e.message})`);
+      });
+    });
+
+    // Останній рубіж. Сюди має не доходити, але якщо дійде -- хай це буде
+    // рядок у логу, а не тиша й мертвий міст.
+    process.on('unhandledRejection', (e) => {
+      console.error(`[discord] unhandled rejection: ${(e && e.stack) || e}`);
+    });
     // Keeps members.cache honest after the initial fetch: discord.js
     // replaces the cached member on each of these, so role changes made in
     // Discord reach the game on the next poll rather than the next restart.
     this.client.on('guildMemberUpdate', (o, n) => { if (n && n.guild) n.guild.members.cache.set(n.id, n); });
     this.client.on('guildMemberAdd', (m) => { if (m && m.guild) m.guild.members.cache.set(m.id, m); });
+
+    // Канал видалили посеред сеансу -- ПЕРЕСТАЄМО спрямовувати.
+    //
+    // Без цього обіцянка в заголовку #ensureCommandChannel («команди знову
+    // працюють будь-де, а не ніде») діяла лише на старті. Видалений о 20:00
+    // канал лишав this.commandChannelId вказувати в порожнечу до кінця
+    // роботи процесу: кожен /link у кожному каналі відмовлявся посиланням на
+    // канал, якого немає, а полагодити це міг тільки адмін -- бо саме
+    // /openzone channel і винятий з перевірки. Гільдія переставала
+    // прив'язуватись зовсім.
+    this.client.on('channelDelete', (c) => {
+      if (!c || c.id !== this.commandChannelId) return;
+      this.commandChannelId = null;
+      try {
+        this.store.setGuildRef('commandChannelId', null);
+      } catch (e) {
+        console.warn(`[discord] could not forget the deleted channel (${e.message})`);
+      }
+      console.warn('[discord] the command channel was deleted; commands are allowed anywhere until /openzone channel setup');
+    });
   }
 
   // Set by index.js after construction: the bridge owns the code table, the
@@ -197,50 +240,114 @@ export class DiscordSide {
     const known = this.store.guildRef('commandChannelId');
 
     if (known) {
-      const ch = await this.guild.channels.fetch(known).catch(() => null);
-      if (ch) {
+      const r = await this.#lookUp(known);
+
+      if (r.channel) {
         this.commandChannelId = known;
-        console.log(`[discord] command channel #${ch.name}`);
+        console.log(`[discord] command channel #${r.channel.name}`);
         return;
       }
+
+      // WE DO NOT KNOW. A 500 during a Discord incident, or a View Channel
+      // override an admin just removed, must NOT be read as "deleted": that
+      // erases his configuration permanently over a hiccup, and he finds out
+      // when a duplicate appears next time somebody runs setup.
+      //
+      // Keep the record, leave steering off. Commands work everywhere for
+      // now -- which is the safe half -- and the next restart adopts the
+      // channel again once Discord answers.
+      if (r.unsure) {
+        console.warn(`[discord] cannot see the command channel right now (${r.why}); keeping the record, commands are allowed anywhere meanwhile`);
+        return;
+      }
+
       this.store.setGuildRef('commandChannelId', null);
       console.warn('[discord] the command channel was deleted; commands are allowed anywhere until /openzone channel setup');
       return;
     }
 
-    const made = await this.#makeCommandChannel();
-    if (made) console.log(`[discord] command channel #${made.name} created`);
+    const r = await this.#makeCommandChannel();
+    if (r.ok) console.log(`[discord] command channel #${r.channel.name} created`);
+    else console.warn(`[discord] ${r.why}; commands are allowed anywhere`);
+  }
+
+  // One channel by id, with the three answers kept apart.
+  //
+  // `gone` is ONLY 10003 Unknown Channel. Every other failure is `unsure`,
+  // because "Discord did not answer" and "the channel does not exist" call
+  // for opposite actions and look identical if you catch them together.
+  async #lookUp(id) {
+    try {
+      const ch = await this.guild.channels.fetch(id);
+      return ch ? { channel: ch } : { gone: true };
+    } catch (e) {
+      if (e && e.code === 10003) return { gone: true };
+      return { unsure: true, why: e.message };
+    }
   }
 
   async #makeCommandChannel() {
-    try {
-      // An existing channel with this name is ADOPTED rather than duplicated:
-      // the usual case is a bot that was reinstalled, or a state file that was
-      // lost, and a second "оз-команди" beside the first helps nobody.
-      const name = 'оз-команди';
-      let ch = this.guild.channels.cache.find(
-        (c) => c.type === ChannelType.GuildText && c.name === name,
-      );
+    const name = 'оз-команди';
 
-      if (!ch) {
+    // The STORED ID comes first, before any name matching.
+    //
+    // The header promises a renamed channel is kept, not duplicated -- but
+    // that promise lived only in memory. An admin who renames it and later
+    // runs setup would have had a fresh "оз-команди" built beside his own,
+    // which is exactly the duplicate this design exists to avoid.
+    const known = this.store.guildRef('commandChannelId');
+    if (known) {
+      const r = await this.#lookUp(known);
+      if (r.channel) {
+        this.commandChannelId = r.channel.id;
+        return { ok: true, channel: r.channel };
+      }
+      // Not knowing is not a licence to build a second one.
+      if (r.unsure) return { ok: false, why: `cannot see the recorded channel (${r.why})` };
+    }
+
+    let ch = null;
+    try {
+      // FETCH, do not read the cache. guild.channels.cache starts EMPTY and
+      // is filled by GUILD_CREATE, which on a large guild can land after
+      // this code runs -- and an empty cache means "no channel by that name",
+      // which means a duplicate. The member cache taught us this once
+      // already, further down this file.
+      const all = await this.guild.channels.fetch();
+      ch = all.find((c) => c && c.type === ChannelType.GuildText && c.name === name);
+    } catch (e) {
+      // Cannot see the channel list -> cannot rule out a duplicate. Refusing
+      // to build is the recoverable failure; building is not.
+      return { ok: false, why: `cannot list channels (${e.message})` };
+    }
+
+    if (!ch) {
+      try {
         ch = await this.guild.channels.create({
           name,
           type: ChannelType.GuildText,
           topic: 'Команди OpenZone. Тут працює /link — привʼязка акаунта Discord до персонажа.',
         });
+      } catch (e) {
+        // Not fatal, and deliberately so: carrying conversations is this
+        // bot's other job and it needs no channel of its own. A missing
+        // Manage Channels permission should produce a sentence telling you
+        // to grant it, not a bridge that will not start.
+        return { ok: false, why: `could not create the command channel (${e.message})` };
       }
-
-      this.commandChannelId = ch.id;
-      this.store.setGuildRef('commandChannelId', ch.id);
-      return ch;
-    } catch (e) {
-      // Not fatal, and deliberately so: carrying conversations is this bot's
-      // other job and it does not need a channel of its own. A missing
-      // Manage Channels permission should produce a sentence telling you to
-      // grant it, not a bridge that will not start.
-      console.warn(`[discord] could not create the command channel (${e.message}); commands are allowed anywhere`);
-      return null;
     }
+
+    // The channel EXISTS from here on, whatever happens next.
+    this.commandChannelId = ch.id;
+    try {
+      this.store.setGuildRef('commandChannelId', ch.id);
+    } catch (e) {
+      // Reporting this as "could not create" would send the admin to fix a
+      // permission that is already fine, while a channel he cannot see in
+      // the log sits there being used.
+      console.warn(`[discord] #${ch.name} is in use but could not be written down (${e.message}); it will need adopting again after a restart`);
+    }
+    return { ok: true, channel: ch };
   }
 
   // Pull the member list once, and keep it current from the gateway.
@@ -409,9 +516,11 @@ export class DiscordSide {
 
     if (group === 'channel' && sub === 'setup') {
       await i.deferReply({ flags: MessageFlags.Ephemeral });
-      const ch = await this.#makeCommandChannel();
-      if (ch) await i.editReply({ content: `Команди тепер у <#${ch.id}>.` });
-      else await i.editReply({ content: 'Не вдалося створити канал — боту бракує права Manage Channels.' });
+      const r = await this.#makeCommandChannel();
+      // Кажемо, ЩО САМЕ не вийшло. «Бракує Manage Channels» на будь-яку
+      // невдачу відправляло б адміна лагодити право, яке й так є.
+      if (r.ok) await i.editReply({ content: `Команди тепер у <#${r.channel.id}>.` });
+      else await i.editReply({ content: `Не вийшло: ${r.why}` });
       return;
     }
 
