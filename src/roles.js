@@ -386,10 +386,27 @@ export class Roles {
     const remove = [];
 
     if (op === 'faction.set' || op === 'faction.clear') {
+      const was = factionOf(target);
+
+      // ALREADY THERE -- change nothing, and say yes.
+      //
+      // Without this the "leaving takes its posts" rule below fires on a
+      // move to the faction he is already in: the role comes off, every post
+      // with it, and the role goes back on. A leader double-clicking accept
+      // on one of his own stripped him of every post he held, and a leader
+      // who did it to himself lost his leadership without a word. Measured
+      // -- Posts went from ["leader"] to [] and the next refusal blamed the
+      // wrong thing.
+      //
+      // Yes rather than a refusal, because the state he asked for is the
+      // state that holds. That is what makes this safe to press twice.
+      if (op === 'faction.set' && was && was.Slug === arg) {
+        return { ok: true };
+      }
+
       // Leaving a faction takes its posts with it. A "Лідер Долга" badge on
       // somebody who is no longer in Duty is exactly the stale state the
       // resolve() rules already refuse to honour -- so do not create it.
-      const was = factionOf(target);
       if (was) {
         remove.push(was.RoleId);
         for (const p of was.Posts || []) if (held(target, p.RoleId)) remove.push(p.RoleId);
