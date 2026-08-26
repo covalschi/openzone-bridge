@@ -11,8 +11,12 @@ The bridge closes that gap:
 - **Game to Discord** — the DayZ server POSTs to the bridge; the bridge writes to
   Discord.
 - **Discord to game** — the bridge holds the game's poll request open until something
-  happens, then answers with a batch. DayZ's REST timeout is configurable up to 120
-  seconds, so this behaves like a push with none of the latency of short polling.
+  happens, then answers with a batch, so this behaves like a push with none of the
+  latency of short polling. The hold is kept **under ten seconds**: the engine kills
+  an asynchronous REST request at exactly ten, whatever `SetOption` was told. The
+  3..120 range in the docs describes the blocking `POST_now`, not the async path
+  this uses — measured on the stand, and the reason `POLL_HOLD_SECONDS` defaults
+  to 8.
 
 ## What it does
 
@@ -34,7 +38,17 @@ in the request body, because DayZ cannot set an `Authorization` header, so the e
 
 ## Status
 
-Not started. Design lives with the OpenZone specs.
+Working, and exercised against a live guild — private threads created, messages
+posted through a webhook, the game's long poll served for hours at a stretch, and
+the bridge's own echo suppressed so a player never sees his line twice.
+
+Not production-ready, and the gaps are named rather than hidden: no HTTPS (a plain
+`node:http` listener, while the shared secret travels in the body), no outbound
+queue or retry, no rate limiting, no input validation, no process supervision, no
+health check anybody reads. Discord role mirroring is designed and not built.
+
+Run it behind a TLS terminator and treat `OZ_SHARED_SECRET` as what it is:
+credentials to every player's private conversations.
 
 ## Licence
 

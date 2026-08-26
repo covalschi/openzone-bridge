@@ -112,8 +112,20 @@ openssl rand -hex 32
 - `.env` → `OZ_SHARED_SECRET`
 - the game server's `$profile:OpenZone\Settings.json` → `Bridge.Secret`
 
-Leave `DISCORD_PARENT_CHANNEL_ID` empty. The bridge creates the parent channel
-on first run and prints its id.
+`DISCORD_PARENT_CHANNEL_ID` is **required** — the bridge refuses to start without
+it. Every private conversation is a thread, and a thread needs a channel to hang
+from.
+
+Make the channel yourself:
+
+1. In your server, create a normal text channel — `#openzone` will do. Threads
+   only work under a text channel, not under a category or a forum.
+2. Make sure the bot can see it, and that it has **Manage Threads**, **Create
+   Private Threads** and **Send Messages** there.
+3. Right-click the channel → **Copy Channel ID** and paste it into `.env`.
+
+Players never read this channel. They only ever see the threads they are added
+to.
 
 ---
 
