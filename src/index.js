@@ -214,8 +214,37 @@ function drain({ ServerId, Cursor, Uids }) {
     }
   }
 
+  // Roles, for the linked players this server is asking about.
+  //
+  // Sent EVERY poll rather than on change, and that is deliberate: the
+  // bridge has no way to learn that a game server restarted and forgot
+  // everything, and a role projection that only arrives on change would
+  // leave the whole server unaffiliated until somebody happened to edit a
+  // role in Discord. It is a handful of small objects on an 8-second poll.
+  //
+  // UNLINKED PLAYERS ARE OMITTED, not sent empty. Absent means "we know
+  // nothing about him"; an empty projection would mean "Discord says he has
+  // no faction", and the game treats those two very differently -- one falls
+  // back to the account file, the other overrides it.
+  for (const uid of Uids || []) {
+    const view = rolesFor(uid);
+    if (!view) continue;
+    items.push({ Kind: 'roles', Json: JSON.stringify({ Uid: uid, ...view }) });
+  }
+
   cursors.set(ServerId, store.cursor);
   return { Cursor: store.cursor, Items: items };
+}
+
+// One player's roles, or null when we cannot answer for him.
+function rolesFor(uid) {
+  const link = store.linkOf(uid);
+  if (!link) return null;
+
+  const member = discord.memberOf(link.discordId);
+  if (!member) return null;
+
+  return roles.resolve(member);
 }
 
 http = new HttpSide(cfg, {

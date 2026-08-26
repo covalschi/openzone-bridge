@@ -14,6 +14,7 @@ import {
   Client,
   GatewayIntentBits,
   PermissionFlagsBits,
+  MessageFlags,
   Partials,
   ChannelType,
   ThreadAutoArchiveDuration,
@@ -49,6 +50,11 @@ export class DiscordSide {
 
     this.client.on('messageCreate', (m) => this.#incoming(m));
     this.client.on('interactionCreate', (i) => this.#interaction(i));
+    // Keeps members.cache honest after the initial fetch: discord.js
+    // replaces the cached member on each of these, so role changes made in
+    // Discord reach the game on the next poll rather than the next restart.
+    this.client.on('guildMemberUpdate', (o, n) => { if (n && n.guild) n.guild.members.cache.set(n.id, n); });
+    this.client.on('guildMemberAdd', (m) => { if (m && m.guild) m.guild.members.cache.set(m.id, m); });
   }
 
   // Set by index.js after construction: the bridge owns the code table, the
@@ -71,6 +77,7 @@ export class DiscordSide {
 
     this.webhook = await this.#ensureWebhook();
     await this.#registerCommands();
+    await this.#warmMembers();
     console.log(`[discord] logged in as ${this.client.user.tag}`);
   }
 
@@ -139,6 +146,47 @@ export class DiscordSide {
     }
   }
 
+  // Pull the member list once, and keep it current from the gateway.
+  //
+  // This is not optional: guild.members.cache starts EMPTY. The gateway
+  // populates roles.cache on its own but not members, and
+  // client.guilds.fetch() short-circuits to the cached Guild without any
+  // REST call at all -- so without this, memberOf() returns null for
+  // everybody and no role projection is ever sent. Cost me one live test
+  // to find: the sink registered, the poll ran, and every batch was empty.
+  //
+  // Fetched ONCE rather than per lookup, because the lookup runs for every
+  // linked player on every eight-second poll and a fetch there would be a
+  // rate-limit problem instead of a cache.
+  async #warmMembers() {
+    try {
+      const members = await this.guild.members.fetch();
+      console.log(`[discord] member cache warm: ${members.size}`);
+    } catch (e) {
+      // Needs the GuildMembers intent, which is privileged and off by
+      // default in the developer portal. Say which switch, because the
+      // symptom otherwise is 'roles silently never arrive'.
+      console.warn(
+        `[discord] could not fetch members (${e.message}). ` +
+          'Enable SERVER MEMBERS INTENT for this application in the Discord ' +
+          'developer portal, or role projection will stay empty.',
+      );
+    }
+  }
+
+  // A cached guild member by Discord id, or null.
+  //
+  // Cache only, never a fetch: this runs inside the poll drain, for every
+  // linked player, every eight seconds. A fetch per player there would turn a
+  // role lookup into a rate-limit problem. A member we have never seen
+  // reports null -- which the game reads as "we do not know", not as "he has
+  // no roles".
+  memberOf(discordId) {
+    if (!discordId) return null;
+    if (!this.guild) return null;
+    return this.guild.members.cache.get(discordId) || null;
+  }
+
   useRoles(roles) {
     this.roles = roles;
   }
@@ -156,7 +204,7 @@ export class DiscordSide {
     // Ephemeral throughout: a link code on a public channel is an invitation
     // for whoever reads it faster than you do.
     if (!this.codes) {
-      await i.reply({ content: 'Linking is not available right now.', ephemeral: true });
+      await i.reply({ content: 'Linking is not available right now.', flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -169,7 +217,7 @@ export class DiscordSide {
     if (r.ok) {
       await i.reply({
         content: 'Linked. Your PDA will notice within a few seconds.',
-        ephemeral: true,
+        flags: MessageFlags.Ephemeral,
       });
       console.log(`[discord] linked ${r.steamId} to ${i.user.tag}`);
       return;
@@ -182,7 +230,7 @@ export class DiscordSide {
     if (r.reason === 'unknown') why = 'That code is unknown or has expired. Press the button in your PDA again for a fresh one.';
     if (r.reason === 'taken') why = 'That character is already linked to a different Discord account.';
 
-    await i.reply({ content: why, ephemeral: true });
+    await i.reply({ content: why, flags: MessageFlags.Ephemeral });
   }
 
   // Configuration lives in the bot, so this is where an admin drives it.
@@ -192,11 +240,11 @@ export class DiscordSide {
   // than trusted.
   async #openzone(i) {
     if (!i.memberPermissions || !i.memberPermissions.has(PermissionFlagsBits.Administrator)) {
-      await i.reply({ content: 'That is for server administrators.', ephemeral: true });
+      await i.reply({ content: 'That is for server administrators.', flags: MessageFlags.Ephemeral });
       return;
     }
     if (!this.roles) {
-      await i.reply({ content: 'The role roster is not available right now.', ephemeral: true });
+      await i.reply({ content: 'The role roster is not available right now.', flags: MessageFlags.Ephemeral });
       return;
     }
 
@@ -206,7 +254,7 @@ export class DiscordSide {
     if (group === 'roles' && sub === 'sync') {
       // Creating a dozen roles takes longer than the three seconds Discord
       // gives an interaction, so defer first or the reply is refused.
-      await i.deferReply({ ephemeral: true });
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
 
       const r = await this.roles.sync(i.guild);
 
@@ -230,11 +278,11 @@ export class DiscordSide {
         if (e.node.Missing) mark = '(deleted in Discord)';
         lines.push('`' + e.slug + '` ' + mark);
       }
-      await i.reply({ content: lines.join('\n').slice(0, 1900), ephemeral: true });
+      await i.reply({ content: lines.join('\n').slice(0, 1900), flags: MessageFlags.Ephemeral });
       return;
     }
 
-    await i.reply({ content: 'Unknown command.', ephemeral: true });
+    await i.reply({ content: 'Unknown command.', flags: MessageFlags.Ephemeral });
   }
 
   // Webhooks need Manage Webhooks, which is easy to leave out of the invite.
