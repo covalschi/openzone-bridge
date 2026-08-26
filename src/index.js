@@ -17,6 +17,7 @@ import { Store } from './store.js';
 import { DiscordSide } from './discord.js';
 import { HttpSide } from './http.js';
 import { OAuthSide } from './oauth.js';
+import { LinkCodes } from './codes.js';
 
 function need(name) {
   const v = process.env[name];
@@ -58,6 +59,11 @@ const discord = new DiscordSide(cfg, store, (key, msg) => {
 });
 
 const oauth = new OAuthSide(cfg, store, discord);
+
+// The code table lives here and the Discord side redeems against it, so the
+// bot never owns state the HTTP side cannot see.
+const codes = new LinkCodes(store);
+discord.useCodes(codes);
 
 // Members of a conversation, as Discord ids, skipping whoever has not linked.
 function discordIdsOf(members) {
@@ -156,11 +162,26 @@ const routes = {
 
   // --- account link ---
 
-  '/v1/link/begin': async ({ Json }) => ({ Url: oauth.begin(Json.Uid) }),
+  // A short code, not a URL. The player reads it off the PDA screen and runs
+  // /link <code> in Discord; the bot knows who they are from the interaction.
+  // Url is still returned for anyone running the old OAuth flow, but the game
+  // shows the code.
+  '/v1/link/begin': async ({ Json }) => {
+    const c = codes.mint(Json.Uid);
+    return { Code: c.code, ExpiresInSec: c.expiresInSec, Url: oauth.begin(Json.Uid) };
+  },
 
+  // DiscordId comes back too. The game stores it as the fact of the link --
+  // without it the server had nothing true to write and would have had to
+  // invent something, which is how a field ends up holding a SteamID under a
+  // name that says Discord.
   '/v1/link/status': async ({ Json }) => {
     const l = store.linkOf(Json.Uid);
-    return { Linked: !!l, DiscordName: l?.discordName || '' };
+    return {
+      Linked: !!l,
+      DiscordId: l?.discordId || '',
+      DiscordName: l?.discordName || '',
+    };
   },
 };
 

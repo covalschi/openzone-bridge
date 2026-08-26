@@ -47,6 +47,14 @@ export class DiscordSide {
     });
 
     this.client.on('messageCreate', (m) => this.#incoming(m));
+    this.client.on('interactionCreate', (i) => this.#interaction(i));
+  }
+
+  // Set by index.js after construction: the bridge owns the code table, the
+  // Discord side only redeems against it. Kept as a setter rather than a
+  // constructor argument so this class stays constructible without it.
+  useCodes(codes) {
+    this.codes = codes;
   }
 
   async start() {
@@ -61,7 +69,78 @@ export class DiscordSide {
     }
 
     this.webhook = await this.#ensureWebhook();
+    await this.#registerCommands();
     console.log(`[discord] logged in as ${this.client.user.tag}`);
+  }
+
+  // Registered on the GUILD, not globally: guild commands appear immediately,
+  // global ones take up to an hour to propagate and would make every change
+  // here untestable.
+  //
+  // Failing to register is not fatal. The bot's whole other job -- carrying
+  // conversations -- does not need commands, and a missing `applications.commands`
+  // scope in the invite is exactly the kind of thing that should produce a
+  // sentence telling you to fix the invite, not a bridge that will not start.
+  async #registerCommands() {
+    try {
+      await this.guild.commands.set([
+        {
+          name: 'link',
+          description: 'Link your Discord account to your character',
+          options: [
+            {
+              name: 'code',
+              description: 'The six-character code your PDA is showing',
+              type: 3, // STRING
+              required: true,
+            },
+          ],
+        },
+      ]);
+      console.log('[discord] /link registered on the guild');
+    } catch (e) {
+      console.warn(
+        `[discord] could not register slash commands (${e.message}). ` +
+          'The invite probably lacks the applications.commands scope. ' +
+          'Chat still works; /link will not.',
+      );
+    }
+  }
+
+  async #interaction(i) {
+    if (!i.isChatInputCommand()) return;
+    if (i.commandName !== 'link') return;
+
+    // Ephemeral throughout: a link code on a public channel is an invitation
+    // for whoever reads it faster than you do.
+    if (!this.codes) {
+      await i.reply({ content: 'Linking is not available right now.', ephemeral: true });
+      return;
+    }
+
+    const r = this.codes.redeem(
+      i.options.getString('code'),
+      i.user.id,
+      i.user.username,
+    );
+
+    if (r.ok) {
+      await i.reply({
+        content: 'Linked. Your PDA will notice within a few seconds.',
+        ephemeral: true,
+      });
+      console.log(`[discord] linked ${r.steamId} to ${i.user.tag}`);
+      return;
+    }
+
+    // Each refusal says what to DO, because the player is standing in a menu
+    // with a code on the screen and a timer running.
+    let why = 'That code did not work.';
+    if (r.reason === 'empty') why = 'Type the code your PDA is showing.';
+    if (r.reason === 'unknown') why = 'That code is unknown or has expired. Press the button in your PDA again for a fresh one.';
+    if (r.reason === 'taken') why = 'That character is already linked to a different Discord account.';
+
+    await i.reply({ content: why, ephemeral: true });
   }
 
   // Webhooks need Manage Webhooks, which is easy to leave out of the invite.
