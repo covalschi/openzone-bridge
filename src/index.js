@@ -199,8 +199,19 @@ const routes = {
 // the game may have restarted too and we cannot know.
 const rosterSeen = new Map();
 
-function drain({ ServerId, Cursor, Uids }) {
+// What role projection each polling server has already been handed, per
+// player: ServerId -> Map(uid -> the exact JSON we sent).
+const rolesSeen = new Map();
+
+function drain({ ServerId, Cursor, Uids, Fresh }) {
   const from = Number.isInteger(Cursor) ? Cursor : (cursors.get(ServerId) ?? 0);
+
+  // The game says so itself when it has just started and remembers nothing.
+  // Everything this server was told before that is void.
+  if (Fresh) {
+    rosterSeen.delete(ServerId);
+    rolesSeen.delete(ServerId);
+  }
 
   const items = [];
   for (const uid of Uids || []) {
@@ -231,22 +242,53 @@ function drain({ ServerId, Cursor, Uids }) {
     rosterSeen.set(ServerId, stamp);
   }
 
-  // Roles, for the linked players this server is asking about.
+  // Roles, for the linked players this server is asking about -- ONLY when
+  // the projection actually changed for this server.
   //
-  // Sent EVERY poll rather than on change, and that is deliberate: the
-  // bridge has no way to learn that a game server restarted and forgot
-  // everything, and a role projection that only arrives on change would
-  // leave the whole server unaffiliated until somebody happened to edit a
-  // role in Discord. It is a handful of small objects on an 8-second poll.
+  // This used to be sent every poll, because the bridge cannot tell a server
+  // that has run for an hour from one that restarted a second ago. That was
+  // the wrong answer to a real problem, and it cost the whole long poll: an
+  // item on every poll means the batch is never empty, a batch that is never
+  // empty means the hold never engages, and the game re-asks on the next
+  // FRAME. Measured on the stand -- 5020 polls in five minutes, seventeen a
+  // second, against 0.12 a second before anybody linked. On a game server
+  // with exactly one core.
+  //
+  // The right answer is to let the game say so. It sets Fresh on its first
+  // poll after start-up, which voids everything remembered here.
   //
   // UNLINKED PLAYERS ARE OMITTED, not sent empty. Absent means "we know
   // nothing about him"; an empty projection would mean "Discord says he has
   // no faction", and the game treats those two very differently -- one falls
   // back to the account file, the other overrides it.
+  let seen = rolesSeen.get(ServerId);
+  if (!seen) {
+    seen = new Map();
+    rolesSeen.set(ServerId, seen);
+  }
+
   for (const uid of Uids || []) {
     const view = rolesFor(uid);
-    if (!view) continue;
-    items.push({ Kind: 'roles', Json: JSON.stringify({ Uid: uid, ...view }) });
+    if (!view) {
+      // Cannot answer for him now. Drop what we remember, so the projection
+      // is sent again the moment we can -- otherwise a player whose link is
+      // being repaired would stay on a stale faction until he next changes
+      // a Discord role.
+      seen.delete(uid);
+      continue;
+    }
+
+    const json = JSON.stringify({ Uid: uid, ...view });
+    if (seen.get(uid) === json) continue;
+
+    items.push({ Kind: 'roles', Json: json });
+    seen.set(uid, json);
+  }
+
+  // Forget whoever left. He may come back to a server that restarted while
+  // he was away, and the projection has to reach him again.
+  for (const uid of [...seen.keys()]) {
+    if (!(Uids || []).includes(uid)) seen.delete(uid);
   }
 
   cursors.set(ServerId, store.cursor);
