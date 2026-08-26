@@ -77,6 +77,7 @@ export class DiscordSide {
 
     this.webhook = await this.#ensureWebhook();
     await this.#registerCommands();
+    await this.#ensureCommandChannel();
     await this.#warmMembers();
     console.log(`[discord] logged in as ${this.client.user.tag}`);
   }
@@ -142,6 +143,28 @@ export class DiscordSide {
                 },
               ],
             },
+            {
+              name: 'channel',
+              description: 'The channel commands belong in',
+              type: 2, // SUB_COMMAND_GROUP
+              options: [
+                {
+                  name: 'setup',
+                  description: 'Create the command channel, or adopt the one that is already there',
+                  type: 1, // SUB_COMMAND
+                },
+                {
+                  name: 'show',
+                  description: 'Say which channel is the command channel',
+                  type: 1, // SUB_COMMAND
+                },
+                {
+                  name: 'forget',
+                  description: 'Stop steering commands to a channel',
+                  type: 1, // SUB_COMMAND
+                },
+              ],
+            },
           ],
         },
       ]);
@@ -152,6 +175,71 @@ export class DiscordSide {
           'The invite probably lacks the applications.commands scope. ' +
           'Chat still works; /link will not.',
       );
+    }
+  }
+
+  // The channel commands belong in.
+  //
+  // The bot BUILDS it, because the alternative is a setup step in a document
+  // nobody reads and a guild where /link works in the roleplay channel. It is
+  // created once, on the first start that finds none recorded.
+  //
+  // Followed by ID, never by name -- an admin who renames it keeps it, and the
+  // bot never builds a second one beside the first. Same rule the role roster
+  // follows, for the same reason.
+  //
+  // DELETED IS NOT RECREATED. An admin who removes it meant to remove it, and
+  // rebuilding it on every restart would be a fight he cannot win. The record
+  // is dropped instead and steering stops -- which is deliberately the SAFE
+  // failure: commands work everywhere again rather than nowhere. `/openzone
+  // channel setup` builds a new one when he wants it back.
+  async #ensureCommandChannel() {
+    const known = this.store.guildRef('commandChannelId');
+
+    if (known) {
+      const ch = await this.guild.channels.fetch(known).catch(() => null);
+      if (ch) {
+        this.commandChannelId = known;
+        console.log(`[discord] command channel #${ch.name}`);
+        return;
+      }
+      this.store.setGuildRef('commandChannelId', null);
+      console.warn('[discord] the command channel was deleted; commands are allowed anywhere until /openzone channel setup');
+      return;
+    }
+
+    const made = await this.#makeCommandChannel();
+    if (made) console.log(`[discord] command channel #${made.name} created`);
+  }
+
+  async #makeCommandChannel() {
+    try {
+      // An existing channel with this name is ADOPTED rather than duplicated:
+      // the usual case is a bot that was reinstalled, or a state file that was
+      // lost, and a second "оз-команди" beside the first helps nobody.
+      const name = 'оз-команди';
+      let ch = this.guild.channels.cache.find(
+        (c) => c.type === ChannelType.GuildText && c.name === name,
+      );
+
+      if (!ch) {
+        ch = await this.guild.channels.create({
+          name,
+          type: ChannelType.GuildText,
+          topic: 'Команди OpenZone. Тут працює /link — привʼязка акаунта Discord до персонажа.',
+        });
+      }
+
+      this.commandChannelId = ch.id;
+      this.store.setGuildRef('commandChannelId', ch.id);
+      return ch;
+    } catch (e) {
+      // Not fatal, and deliberately so: carrying conversations is this bot's
+      // other job and it does not need a channel of its own. A missing
+      // Manage Channels permission should produce a sentence telling you to
+      // grant it, not a bridge that will not start.
+      console.warn(`[discord] could not create the command channel (${e.message}); commands are allowed anywhere`);
+      return null;
     }
   }
 
@@ -203,6 +291,8 @@ export class DiscordSide {
   async #interaction(i) {
     if (!i.isChatInputCommand()) return;
 
+    if (!(await this.#inTheRightChannel(i))) return;
+
     if (i.commandName === 'openzone') {
       await this.#openzone(i);
       return;
@@ -240,6 +330,32 @@ export class DiscordSide {
     if (r.reason === 'taken') why = 'That character is already linked to a different Discord account.';
 
     await i.reply({ content: why, flags: MessageFlags.Ephemeral });
+  }
+
+  // Commands belong in one channel, and everywhere else they are turned away
+  // with a pointer to it -- ephemerally, so the refusal is not itself the
+  // clutter it exists to prevent.
+  //
+  // TWO deliberate holes, and both are about not locking anyone out:
+  //
+  //   - no channel recorded (never built, or deleted) -> allow everywhere.
+  //     Steering is a convenience; being unable to run /link is not.
+  //   - `/openzone channel` -> always allowed. It is the command that FIXES a
+  //     wrong or missing channel, and enforcing it against itself would make
+  //     a deleted channel unrecoverable without editing the state file.
+  async #inTheRightChannel(i) {
+    if (!this.commandChannelId) return true;
+    if (i.channelId === this.commandChannelId) return true;
+
+    if (i.commandName === 'openzone') {
+      if (i.options.getSubcommandGroup(false) === 'channel') return true;
+    }
+
+    await i.reply({
+      content: `Команди OpenZone — у <#${this.commandChannelId}>.`,
+      flags: MessageFlags.Ephemeral,
+    });
+    return false;
   }
 
   // Configuration lives in the bot, so this is where an admin drives it.
@@ -288,6 +404,31 @@ export class DiscordSide {
         lines.push('`' + e.slug + '` ' + mark);
       }
       await i.reply({ content: lines.join('\n').slice(0, 1900), flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (group === 'channel' && sub === 'setup') {
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const ch = await this.#makeCommandChannel();
+      if (ch) await i.editReply({ content: `Команди тепер у <#${ch.id}>.` });
+      else await i.editReply({ content: 'Не вдалося створити канал — боту бракує права Manage Channels.' });
+      return;
+    }
+
+    if (group === 'channel' && sub === 'show') {
+      let msg = 'Каналу для команд немає — команди працюють будь-де.';
+      if (this.commandChannelId) msg = `Команди — у <#${this.commandChannelId}>.`;
+      await i.reply({ content: msg, flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (group === 'channel' && sub === 'forget') {
+      // Drops the STEERING, not the channel. Deleting somebody's channel is
+      // not the bot's call, and an admin asking it to stop pointing there is
+      // not asking it to tear anything down.
+      this.commandChannelId = null;
+      this.store.setGuildRef('commandChannelId', null);
+      await i.reply({ content: 'Більше не спрямовую. Канал лишився на місці.', flags: MessageFlags.Ephemeral });
       return;
     }
 

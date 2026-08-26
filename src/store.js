@@ -24,6 +24,10 @@ const EMPTY = {
   messages: {},
   // monotonic counter handed to the game so it can ask for "anything newer"
   cursor: 0,
+  // Furniture the bot created in the guild and has to find again: key -> id.
+  // Ids, never names -- an admin renaming a channel must not make the bot
+  // build a second one beside it. Same rule the role roster follows.
+  guild: {},
 };
 
 export class Store {
@@ -59,6 +63,19 @@ export class Store {
     const tmp = `${this.path}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.data, null, 2));
     renameSync(tmp, this.path);
+  }
+
+  // ---- guild furniture ----
+
+  guildRef(key) {
+    return (this.data.guild && this.data.guild[key]) || null;
+  }
+
+  setGuildRef(key, id) {
+    this.data.guild ||= {};
+    if (id) this.data.guild[key] = id;
+    else delete this.data.guild[key];
+    this.save();
   }
 
   // ---- account links ----
