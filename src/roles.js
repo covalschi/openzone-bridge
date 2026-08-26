@@ -82,6 +82,7 @@ export const DEFAULTS = {
 
   Traits: [
     { Slug: 'mechanic', Label: 'Механік', Color: C.trait },
+    { Slug: 'medic',    Label: 'Медик',   Color: C.trait },
   ],
 };
 
@@ -89,19 +90,71 @@ export class Roles {
   constructor(path) {
     this.path = path;
     this.data = this.#load();
+
+    // Something shipped in this version that this guild had never heard of.
+    // Written down at once, which also bumps the stamp, which is what tells
+    // the game there is a new roster to take.
+    if (this.grew.length) {
+      console.log(`[roles] new in this version: ${this.grew.join(', ')}`);
+      this.save();
+    }
   }
 
   #load() {
+    this.grew = [];
+
+    let raw = null;
     try {
-      const raw = JSON.parse(readFileSync(this.path, 'utf8'));
-      if (raw && raw.Version) return raw;
+      raw = JSON.parse(readFileSync(this.path, 'utf8'));
     } catch {
       // No file yet, or it is unreadable. Either way we start from the
       // defaults rather than refusing to run: a bot that will not boot
       // because its roster is missing is worse than one that ships the
       // roster it was written with.
     }
-    return structuredClone(DEFAULTS);
+
+    if (!raw || !raw.Version) return structuredClone(DEFAULTS);
+
+    this.#adoptNewDefaults(raw);
+    return raw;
+  }
+
+  // Defaults that shipped since this guild's file was written.
+  //
+  // Without this the defaults are a FIRST-RUN TEMPLATE and nothing more: the
+  // file wins forever after, so a role added in an update reaches nobody who
+  // already runs the bot. Found the honest way -- a trait was added, the bot
+  // restarted, and nothing at all happened.
+  //
+  // ADD ONLY. Never remove an entry this file has and the defaults do not:
+  // that is the admin's own faction, and a bot update is not the moment to
+  // delete it. Never overwrite Label or Color either -- he is allowed to
+  // rename things, and the whole point of following role IDs is that renaming
+  // is safe.
+  #adoptNewDefaults(raw) {
+    const add = (list, node, what) => {
+      if (list.some((x) => x.Slug === node.Slug)) return;
+      list.push(structuredClone(node));
+      this.grew.push(what);
+    };
+
+    raw.Ranks ||= [];
+    raw.Factions ||= [];
+    raw.Traits ||= [];
+
+    for (const r of DEFAULTS.Ranks) add(raw.Ranks, r, r.Slug);
+    for (const t of DEFAULTS.Traits) add(raw.Traits, t, t.Slug);
+
+    for (const f of DEFAULTS.Factions) {
+      const had = raw.Factions.find((x) => x.Slug === f.Slug);
+      if (!had) {
+        add(raw.Factions, f, f.Slug);
+        continue;
+      }
+      // The faction is already here, but a post inside it may not be.
+      had.Posts ||= [];
+      for (const p of f.Posts || []) add(had.Posts, p, f.Slug + ':' + p.Slug);
+    }
   }
 
   // Changes whenever the roster does, so the game can be told once
@@ -137,6 +190,19 @@ export class Roles {
   //
   // Returns a report rather than logging: the caller is a slash command and
   // the person who ran it is waiting for an answer.
+  // Entries that have never been wired to a Discord role at all.
+  //
+  // Deliberately NOT the same as "has no RoleId": an entry the admin deleted
+  // in Discord carries Missing, and that is a decision, not a gap. Counting
+  // it here would make every restart try to resurrect it.
+  pending() {
+    let n = 0;
+    for (const e of this.entries()) {
+      if (!e.node.RoleId && !e.node.Missing) n++;
+    }
+    return n;
+  }
+
   async sync(guild) {
     const made = [];
     const adopted = [];

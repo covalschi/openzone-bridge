@@ -121,6 +121,7 @@ export class DiscordSide {
     this.webhook = await this.#ensureWebhook();
     await this.#registerCommands();
     await this.#ensureCommandChannel();
+    await this.#syncNewRoles();
     await this.#warmMembers();
     console.log(`[discord] logged in as ${this.client.user.tag}`);
   }
@@ -269,6 +270,37 @@ export class DiscordSide {
     const r = await this.#makeCommandChannel();
     if (r.ok) console.log(`[discord] command channel #${r.channel.name} created`);
     else console.warn(`[discord] ${r.why}; commands are allowed anywhere`);
+  }
+
+  // Roles that ship in an update and have never existed in this guild.
+  //
+  // The owner's requirement is that the bot creates the roles itself. That
+  // held for the first run and nowhere after it: adding a trait to the
+  // defaults left an admin to somehow know that /openzone roles sync now
+  // wants running, and until he did, the game would ask about a role nobody
+  // could hold.
+  //
+  // NARROW ON PURPOSE. This runs only when something has never been wired at
+  // all, and sync() itself refuses to resurrect a role marked Missing -- so
+  // a role the admin deleted stays deleted, every time. Nothing happens on a
+  // normal restart, which is why it is safe to have it on a normal restart.
+  async #syncNewRoles() {
+    if (!this.roles) return;
+    if (this.roles.pending() === 0) return;
+
+    try {
+      // FETCH first. roles.cache is filled by GUILD_CREATE and can still be
+      // empty here, and an empty cache reads as "no role by that name" --
+      // which would create a duplicate of a role that already exists.
+      await this.guild.roles.fetch();
+
+      const r = await this.roles.sync(this.guild);
+      if (r.made.length) console.log(`[discord] new roles created: ${r.made.join(', ')}`);
+      if (r.adopted.length) console.log(`[discord] adopted existing roles: ${r.adopted.join(', ')}`);
+      if (r.ambiguous.length) console.warn(`[discord] left alone, ambiguous: ${r.ambiguous.join('; ')}`);
+    } catch (e) {
+      console.warn(`[discord] could not create the new roles (${e.message}); run /openzone roles sync when it is fixed`);
+    }
   }
 
   // One channel by id, with the three answers kept apart.
