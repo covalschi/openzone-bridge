@@ -104,7 +104,15 @@ export class Roles {
     return structuredClone(DEFAULTS);
   }
 
+  // Changes whenever the roster does, so the game can be told once
+  // instead of every poll. A counter rather than a hash: it only has to
+  // differ, and a counter cannot collide.
+  stamp() {
+    return this.data.Stamp || 0;
+  }
+
   save() {
+    this.data.Stamp = (this.data.Stamp || 0) + 1;
     mkdirSync(dirname(this.path), { recursive: true });
     const tmp = this.path + '.tmp';
     writeFileSync(tmp, JSON.stringify(this.data, null, 2));
@@ -237,6 +245,27 @@ export class Roles {
     return { ok: true, was, now: trimmed };
   }
 
+  // The roster as the game needs it: what a faction is CALLED and what
+  // colour it is. Nothing about Discord crosses -- the game never needs a
+  // role id, because the bot resolves roles to slugs before anything is
+  // sent, and a second home for that mapping is exactly the drift this
+  // push exists to remove.
+  //
+  // Relations, Joinable and Hidden are NOT here on purpose. They are
+  // per-server simulation rules that Discord has no surface to express,
+  // and the admin's own file keeps owning them. One direction of flow,
+  // one join key, no drift.
+  roster() {
+    return {
+      Stamp: this.stamp(),
+      Factions: this.data.Factions.map((f) => ({
+        Id: f.Slug,
+        DisplayName: f.Label,
+        Color: hexToRgb(f.Color),
+      })),
+    };
+  }
+
   // What Discord says about one member, resolved onto the three axes.
   //
   // The conflict rules differ ON PURPOSE and both are stated here rather than
@@ -276,4 +305,11 @@ export class Roles {
 
     return { Faction: faction, Conflict: conflict, Posts: posts, Rank: rank, Traits: traits };
   }
+}
+
+// The game reads colours as "R G B" because a human edits that file and
+// 12861480 tells nobody anything.
+function hexToRgb(n) {
+  const v = Number(n) || 0;
+  return [(v >> 16) & 255, (v >> 8) & 255, v & 255].join(' ');
 }

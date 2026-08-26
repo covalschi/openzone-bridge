@@ -194,6 +194,11 @@ const routes = {
 
 // What a polling server has not seen yet. The cursor is per server, and it
 // only moves once we have handed the batch over.
+// What roster stamp each polling server has already been handed.
+// Memory only: a bridge restart re-sends it once, which is right --
+// the game may have restarted too and we cannot know.
+const rosterSeen = new Map();
+
 function drain({ ServerId, Cursor, Uids }) {
   const from = Number.isInteger(Cursor) ? Cursor : (cursors.get(ServerId) ?? 0);
 
@@ -212,6 +217,18 @@ function drain({ ServerId, Cursor, Uids }) {
         }),
       });
     }
+  }
+
+  // The roster, but ONLY when it changed for this server.
+  //
+  // Two kilobytes seven times a minute for data that changes once a month
+  // would be silly. Per-ServerId because one bridge serves several stands
+  // and they restart independently -- a server that just came back needs
+  // it again even though nothing changed.
+  const stamp = roles.stamp();
+  if (rosterSeen.get(ServerId) !== stamp) {
+    items.push({ Kind: 'roster', Json: JSON.stringify(roles.roster()) });
+    rosterSeen.set(ServerId, stamp);
   }
 
   // Roles, for the linked players this server is asking about.
