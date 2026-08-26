@@ -13,6 +13,7 @@
 import {
   Client,
   GatewayIntentBits,
+  PermissionFlagsBits,
   Partials,
   ChannelType,
   ThreadAutoArchiveDuration,
@@ -96,8 +97,39 @@ export class DiscordSide {
             },
           ],
         },
+        {
+          name: 'openzone',
+          description: 'OpenZone server configuration',
+          // A STRING bitfield, quoted deliberately: discord.js BigInt-parses
+          // this key behind a truthiness check, so a bare numeric 0 slips
+          // through unconverted. 8 is Administrator.
+          //
+          // It is a DEFAULT, not a boundary -- a guild owner can widen it in
+          // Server Settings, which is why every handler checks permissions
+          // again on arrival.
+          default_member_permissions: '8',
+          options: [
+            {
+              name: 'roles',
+              description: 'The role roster',
+              type: 2, // SUB_COMMAND_GROUP
+              options: [
+                {
+                  name: 'sync',
+                  description: 'Create any roles that do not exist yet, and adopt those that do',
+                  type: 1, // SUB_COMMAND
+                },
+                {
+                  name: 'list',
+                  description: 'Show the roster and which roles are wired up',
+                  type: 1, // SUB_COMMAND
+                },
+              ],
+            },
+          ],
+        },
       ]);
-      console.log('[discord] /link registered on the guild');
+      console.log('[discord] /link and /openzone registered on the guild');
     } catch (e) {
       console.warn(
         `[discord] could not register slash commands (${e.message}). ` +
@@ -107,8 +139,18 @@ export class DiscordSide {
     }
   }
 
+  useRoles(roles) {
+    this.roles = roles;
+  }
+
   async #interaction(i) {
     if (!i.isChatInputCommand()) return;
+
+    if (i.commandName === 'openzone') {
+      await this.#openzone(i);
+      return;
+    }
+
     if (i.commandName !== 'link') return;
 
     // Ephemeral throughout: a link code on a public channel is an invitation
@@ -141,6 +183,58 @@ export class DiscordSide {
     if (r.reason === 'taken') why = 'That character is already linked to a different Discord account.';
 
     await i.reply({ content: why, ephemeral: true });
+  }
+
+  // Configuration lives in the bot, so this is where an admin drives it.
+  //
+  // default_member_permissions is only a DEFAULT -- a guild owner can widen
+  // it in Server Settings -- so the permission is checked again here rather
+  // than trusted.
+  async #openzone(i) {
+    if (!i.memberPermissions || !i.memberPermissions.has(PermissionFlagsBits.Administrator)) {
+      await i.reply({ content: 'That is for server administrators.', ephemeral: true });
+      return;
+    }
+    if (!this.roles) {
+      await i.reply({ content: 'The role roster is not available right now.', ephemeral: true });
+      return;
+    }
+
+    const group = i.options.getSubcommandGroup(false);
+    const sub = i.options.getSubcommand(false);
+
+    if (group === 'roles' && sub === 'sync') {
+      // Creating a dozen roles takes longer than the three seconds Discord
+      // gives an interaction, so defer first or the reply is refused.
+      await i.deferReply({ ephemeral: true });
+
+      const r = await this.roles.sync(i.guild);
+
+      const lines = [];
+      if (r.made.length) lines.push('**Created:** ' + r.made.join(', '));
+      if (r.adopted.length) lines.push('**Adopted existing:** ' + r.adopted.join(', '));
+      if (r.kept.length) lines.push('**Already wired:** ' + r.kept.length + ' role(s)');
+      if (r.ambiguous.length) lines.push('**Ambiguous, left alone:** ' + r.ambiguous.join('; '));
+      if (r.failed.length) lines.push('**Failed:** ' + r.failed.join('; '));
+      if (!lines.length) lines.push('Nothing to do.');
+
+      await i.editReply({ content: lines.join('\n').slice(0, 1900) });
+      return;
+    }
+
+    if (group === 'roles' && sub === 'list') {
+      const lines = [];
+      for (const e of this.roles.entries()) {
+        let mark = '--';
+        if (e.node.RoleId) mark = '<@&' + e.node.RoleId + '>';
+        if (e.node.Missing) mark = '(deleted in Discord)';
+        lines.push('`' + e.slug + '` ' + mark);
+      }
+      await i.reply({ content: lines.join('\n').slice(0, 1900), ephemeral: true });
+      return;
+    }
+
+    await i.reply({ content: 'Unknown command.', ephemeral: true });
   }
 
   // Webhooks need Manage Webhooks, which is easy to leave out of the invite.

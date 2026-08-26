@@ -18,6 +18,7 @@ import { DiscordSide } from './discord.js';
 import { HttpSide } from './http.js';
 import { OAuthSide } from './oauth.js';
 import { LinkCodes } from './codes.js';
+import { Roles } from './roles.js';
 
 function need(name) {
   const v = process.env[name];
@@ -64,6 +65,12 @@ const oauth = new OAuthSide(cfg, store, discord);
 // bot never owns state the HTTP side cannot see.
 const codes = new LinkCodes(store);
 discord.useCodes(codes);
+
+// The roster lives in its own file, not in the bridge state: store.save()
+// rewrites the whole state document on every single chat message, and role
+// ids have no business riding that.
+const roles = new Roles(cfg.statePath.replace(/[^\\/]+$/, 'roles.json'));
+discord.useRoles(roles);
 
 // Members of a conversation, as Discord ids, skipping whoever has not linked.
 function discordIdsOf(members) {
