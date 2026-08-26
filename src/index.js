@@ -190,7 +190,91 @@ const routes = {
       DiscordName: l?.discordName || '',
     };
   },
+
+  // The game asking for somebody's roles to be CHANGED.
+  //
+  // The only inbound write there is, and deliberately the only one. The game
+  // holds no faction of its own: it asks here, the Discord role changes, and
+  // the change reaches the game as an ordinary projection on the next poll.
+  // One home for the fact and one direction of travel -- so a refusal here
+  // means nothing changed anywhere, which is what makes it safe to report the
+  // refusal honestly instead of papering over it.
+  //
+  // AUTHORITY IS RE-CHECKED HERE. The game holds the shared secret and is
+  // trusted, and it does its own check first; that does not make it the only
+  // thing between a player and a role. Admin is the exception: whether a
+  // SteamID is a server admin is knowledge only the game has, so that claim
+  // is taken on the secret alone.
+  '/v1/roles/apply': async ({ Json }) => {
+    if (!discord.guild) return { Ok: false, Why: 'the bot is not connected' };
+
+    const targetLink = store.linkOf(Json.TargetUid);
+    if (!targetLink) return { Ok: false, Why: 'that player has not linked a Discord account' };
+
+    const target = discord.memberOf(targetLink.discordId);
+    if (!target) return { Ok: false, Why: 'that player is not in this Discord server' };
+
+    // The actor is absent for an admin action -- the game vouches for it.
+    let actor = null;
+    if (Json.ActorUid) {
+      const actorLink = store.linkOf(Json.ActorUid);
+      if (!actorLink) return { Ok: false, Why: 'you have not linked a Discord account' };
+      actor = discord.memberOf(actorLink.discordId);
+      if (!actor) return { Ok: false, Why: 'you are not in this Discord server' };
+    }
+
+    if (!Json.Admin) {
+      const gate = leaderMay(actor, Json.Op, Json.Arg, target);
+      if (!gate.ok) return { Ok: false, Why: gate.why };
+    }
+
+    const r = await roles.apply(discord.guild, actor, target, Json.Op, Json.Arg);
+    if (!r.ok) return { Ok: false, Why: r.why };
+
+    console.log(`[roles] ${Json.Admin ? 'admin' : Json.ActorUid} ${Json.Op} ${Json.Arg || ''} -> ${Json.TargetUid}`);
+    return { Ok: true, Why: '' };
+  },
 };
+
+// What a leader is allowed to do, and only inside his own faction.
+//
+// Separate from roles.apply on purpose: apply answers "can this role change
+// be made", this answers "is this person allowed to ask for it". Mixing them
+// is how an authority check ends up depending on whether a role happens to
+// exist.
+function leaderMay(actor, op, arg, target) {
+  if (!actor) return { ok: false, why: 'only a faction leader can do that' };
+
+  const view = roles.resolve(actor);
+  if (!view.Faction) return { ok: false, why: 'you are not in a faction' };
+  if (!view.Posts.includes('leader')) return { ok: false, why: 'only the leader of a faction can do that' };
+
+  const mine = view.Faction;
+
+  // Taking somebody INTO the faction is the one case where the target is not
+  // yet a member, so it is checked against the faction being joined.
+  if (op === 'faction.set') {
+    if (arg !== mine) return { ok: false, why: 'you can only take players into your own faction' };
+    return { ok: true };
+  }
+
+  // Everything else acts on somebody who must already be one of his.
+  const theirs = roles.resolve(target).Faction;
+  if (theirs !== mine) return { ok: false, why: 'that player is not in your faction' };
+
+  if (op === 'faction.clear') return { ok: true };
+  if (op === 'leader.transfer') return { ok: true };
+
+  if (op === 'post.add' || op === 'post.remove') {
+    if (!arg || !arg.startsWith(mine + ':')) return { ok: false, why: 'that post does not belong to your faction' };
+    // Leadership is handed over, never handed out: a leader who can grant the
+    // leader post can mint a second leader, and then neither of them is one.
+    if (arg === mine + ':leader') return { ok: false, why: 'use hand over leadership for that' };
+    return { ok: true };
+  }
+
+  return { ok: false, why: 'only an administrator can do that' };
+}
 
 // What a polling server has not seen yet. The cursor is per server, and it
 // only moves once we have handed the batch over.
