@@ -59,8 +59,11 @@ export const DEFAULTS = {
         { Slug: 'professor', Label: 'Професор вчених' },
         { Slug: 'guard', Label: 'Охорона вчених' },
       ] },
-    { Slug: 'duty', Label: 'Борг', Color: C.duty,
-      Posts: [{ Slug: 'leader', Label: 'Лідер Боргу' }] },
+    // EXCEPTION, and a deliberate one: every other label here is Ukrainian,
+    // but Duty ships under its original name because that is what players
+    // recognise. Recorded in CLAUDE.md so it does not read as an oversight.
+    { Slug: 'duty', Label: 'Долг', Color: C.duty,
+      Posts: [{ Slug: 'leader', Label: 'Лідер Долга' }] },
     { Slug: 'freedom', Label: 'Воля', Color: C.freedom,
       Posts: [{ Slug: 'leader', Label: 'Лідер Волі' }] },
     { Slug: 'mercenary', Label: 'Найманці', Color: C.mercenary,
@@ -199,6 +202,39 @@ export class Roles {
 
     this.save();
     return { made, adopted, kept, failed, ambiguous };
+  }
+
+  // Rename a role FROM the bot, so configuration stays in Discord rather
+  // than in Server Settings. sync() adopts a rename made by hand; this is
+  // the same move driven from a command, which is what the owner asked
+  // for -- configure it where you already are.
+  async rename(guild, slug, name) {
+    const trimmed = String(name || '').trim();
+    if (!trimmed) return { ok: false, why: 'Give it a name.' };
+    if (trimmed.length > 100) return { ok: false, why: 'Discord caps role names at 100 characters.' };
+
+    let hit = null;
+    for (const e of this.entries()) if (e.slug === slug) { hit = e; break; }
+    if (!hit) return { ok: false, why: 'No such entry. Run /openzone roles list to see the slugs.' };
+    if (!hit.node.RoleId) return { ok: false, why: 'That one has no Discord role yet. Run /openzone roles sync first.' };
+
+    const role = guild.roles.cache.get(hit.node.RoleId);
+    if (!role) return { ok: false, why: 'That role no longer exists in Discord.' };
+
+    try {
+      await role.setName(trimmed, 'OpenZone roster rename');
+    } catch (err) {
+      // 50013 is BOTH 'no Manage Roles' and 'that role outranks you', and
+      // Discord gives no way to tell them apart, so the message says both.
+      let why = err.message;
+      if (err.code === 50013) why = 'missing permissions, or that role sits above the bot';
+      return { ok: false, why };
+    }
+
+    const was = hit.node.Label;
+    hit.node.Label = trimmed;
+    this.save();
+    return { ok: true, was, now: trimmed };
   }
 
   // What Discord says about one member, resolved onto the three axes.

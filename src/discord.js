@@ -131,6 +131,15 @@ export class DiscordSide {
                   description: 'Show the roster and which roles are wired up',
                   type: 1, // SUB_COMMAND
                 },
+                {
+                  name: 'rename',
+                  description: 'Rename one role, in Discord and in the roster',
+                  type: 1, // SUB_COMMAND
+                  options: [
+                    { name: 'slug', description: 'The entry, e.g. duty or duty:leader', type: 3, required: true },
+                    { name: 'name', description: 'What the role should be called', type: 3, required: true },
+                  ],
+                },
               ],
             },
           ],
@@ -279,6 +288,14 @@ export class DiscordSide {
         lines.push('`' + e.slug + '` ' + mark);
       }
       await i.reply({ content: lines.join('\n').slice(0, 1900), flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (group === 'roles' && sub === 'rename') {
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const r = await this.roles.rename(i.guild, i.options.getString('slug'), i.options.getString('name'));
+      if (r.ok) await i.editReply({ content: `Renamed \`${i.options.getString('slug')}\`: **${r.was}** -> **${r.now}**` });
+      else await i.editReply({ content: r.why });
       return;
     }
 
