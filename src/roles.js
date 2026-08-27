@@ -321,188 +321,74 @@ export class Roles {
   // per-server simulation rules that Discord has no surface to express,
   // and the admin's own file keeps owning them. One direction of flow,
   // one join key, no drift.
-  roster() {
-    return {
-      Stamp: this.stamp(),
-      Factions: this.data.Factions.map((f) => ({
-        Id: f.Slug,
-        DisplayName: f.Label,
-        Color: hexToRgb(f.Color),
-      })),
+  // The roster, cut into pieces small enough to survive the wire.
+  //
+  // ONE BIG ITEM DOES NOT ARRIVE. The game reported "Missing a closing
+  // quotation mark in string" -- the item's Json field reaches it TRUNCATED,
+  // not malformed at the source. Measured on the stand: 805 bytes arrives,
+  // ~1200 does not, and adding the eleven post labels crossed it.
+  //
+  // Splitting rather than trimming, because the limit is somebody else's and
+  // sitting next to it is how this breaks again the day a faction is added.
+  // The pieces merge on their own: ApplyRoster adds and updates and never
+  // deletes, so a roster in four parts is the same roster.
+  //
+  // Every piece carries the same Stamp -- it is one roster, and the game
+  // tracks having seen that stamp, not having seen N items.
+  rosterParts() {
+    const stamp = this.stamp();
+
+    const factions = this.data.Factions.map((f) => ({
+      Id: f.Slug,
+      DisplayName: f.Label,
+      Color: hexToRgb(f.Color),
+    }));
+
+    // Ranks, traits and posts travel for the SAME reason factions do: the bot
+    // owns what a role is called, because it is the bot that creates it.
+    // Without them the game receives "stalker-legend" and has nothing to draw
+    // but the slug -- which is how a player reads his own rank in lowercase
+    // English on a Ukrainian screen.
+    const ranks  = this.data.Ranks.map((r) => ({ Id: r.Slug, DisplayName: r.Label }));
+    const traits = this.data.Traits.map((t) => ({ Id: t.Slug, DisplayName: t.Label }));
+    const posts  = this.data.Factions.flatMap((f) =>
+      (f.Posts || []).map((p) => ({ Id: f.Slug + ':' + p.Slug, DisplayName: p.Label })),
+    );
+
+    const parts = [];
+    let cur = null;
+
+    // Well under the smallest size measured to work, because the limit was
+    // measured, not documented, and a margin is cheaper than another evening.
+    const BUDGET = 600;
+
+    const flush = () => {
+      if (cur) parts.push(cur);
+      cur = { Stamp: stamp, Factions: [], Ranks: [], Traits: [], Posts: [] };
     };
-  }
+    flush();
 
-  // One entry by slug. Posts are addressed "faction:post" because a post slug
-  // is only unique inside its faction -- every faction has a "leader".
-  find(slug) {
-    if (!slug) return null;
-
-    const cut = slug.indexOf(':');
-    if (cut !== -1) {
-      const f = this.data.Factions.find((x) => x.Slug === slug.slice(0, cut));
-      if (!f) return null;
-      const p = (f.Posts || []).find((x) => x.Slug === slug.slice(cut + 1));
-      if (!p) return null;
-      return { kind: 'post', node: p, faction: f };
-    }
-
-    const r = this.data.Ranks.find((x) => x.Slug === slug);
-    if (r) return { kind: 'rank', node: r };
-
-    const f2 = this.data.Factions.find((x) => x.Slug === slug);
-    if (f2) return { kind: 'faction', node: f2 };
-
-    const t = this.data.Traits.find((x) => x.Slug === slug);
-    if (t) return { kind: 'trait', node: t };
-
-    return null;
-  }
-
-  // Change a member's roles in DISCORD, on behalf of somebody in the game.
-  //
-  // This is the ONLY writer, and that is the whole design. The game never
-  // records a faction of its own: it asks here, this changes the Discord
-  // role, and the change comes back to the game as an ordinary projection on
-  // the next poll. One home for the fact, one direction of travel, and a
-  // refusal here means nothing changed anywhere -- which is exactly why a
-  // refusal can be reported honestly instead of papered over.
-  //
-  // The actor's authority is checked HERE TOO, not only in the game. The game
-  // is trusted (it holds the shared secret) but "trusted" and "the only thing
-  // standing between a player and a role" are different jobs.
-  async apply(guild, actor, target, op, arg) {
-    const idOf = (e) => (e && e.node && !e.node.Missing ? e.node.RoleId : null);
-
-    const held = (member, id) => id && member.roles.cache.has(id);
-
-    // Which faction the member is actually in, by the same rule resolve()
-    // uses -- one held role, or nothing.
-    const factionOf = (member) => {
-      const has = this.data.Factions.filter((f) => held(member, f.RoleId));
-      return has.length === 1 ? has[0] : null;
+    const put = (field, item) => {
+      cur[field].push(item);
+      if (JSON.stringify(cur).length > BUDGET) {
+        // Too big WITH this one -- take it back out, close the piece, and
+        // start the next one holding it.
+        cur[field].pop();
+        flush();
+        cur[field].push(item);
+      }
     };
 
-    const add = [];
-    const remove = [];
+    for (const f of factions) put('Factions', f);
+    for (const r of ranks)    put('Ranks', r);
+    for (const t of traits)   put('Traits', t);
+    for (const p of posts)    put('Posts', p);
 
-    if (op === 'faction.set' || op === 'faction.clear') {
-      const was = factionOf(target);
+    if (cur) parts.push(cur);
 
-      // ALREADY THERE -- change nothing, and say yes.
-      //
-      // Without this the "leaving takes its posts" rule below fires on a
-      // move to the faction he is already in: the role comes off, every post
-      // with it, and the role goes back on. A leader double-clicking accept
-      // on one of his own stripped him of every post he held, and a leader
-      // who did it to himself lost his leadership without a word. Measured
-      // -- Posts went from ["leader"] to [] and the next refusal blamed the
-      // wrong thing.
-      //
-      // Yes rather than a refusal, because the state he asked for is the
-      // state that holds. That is what makes this safe to press twice.
-      if (op === 'faction.set' && was && was.Slug === arg) {
-        return { ok: true };
-      }
-
-      // Leaving a faction takes its posts with it. A "Лідер Долга" badge on
-      // somebody who is no longer in Duty is exactly the stale state the
-      // resolve() rules already refuse to honour -- so do not create it.
-      if (was) {
-        remove.push(was.RoleId);
-        for (const p of was.Posts || []) if (held(target, p.RoleId)) remove.push(p.RoleId);
-      }
-
-      if (op === 'faction.set') {
-        const e = this.find(arg);
-        if (!e || e.kind !== 'faction') return { ok: false, why: `no such faction: ${arg}` };
-        const id = idOf(e);
-        if (!id) return { ok: false, why: `the Discord role for ${arg} is missing` };
-        add.push(id);
-      }
-    } else if (op === 'post.add' || op === 'post.remove') {
-      const e = this.find(arg);
-      if (!e || e.kind !== 'post') return { ok: false, why: `no such post: ${arg}` };
-
-      // A post only means anything inside the faction it belongs to.
-      const now = factionOf(target);
-      if (!now || now.Slug !== e.faction.Slug) {
-        return { ok: false, why: `that player is not in ${e.faction.Label}` };
-      }
-
-      const id = idOf(e);
-      if (!id) return { ok: false, why: `the Discord role for ${arg} is missing` };
-      (op === 'post.add' ? add : remove).push(id);
-    } else if (op === 'trait.add' || op === 'trait.remove') {
-      const e = this.find(arg);
-      if (!e || e.kind !== 'trait') return { ok: false, why: `no such trait: ${arg}` };
-      const id = idOf(e);
-      if (!id) return { ok: false, why: `the Discord role for ${arg} is missing` };
-      (op === 'trait.add' ? add : remove).push(id);
-    } else if (op === 'rank.set') {
-      // One rank at a time: every other one comes off, by the same rule
-      // resolve() reads them with.
-      for (const r of this.data.Ranks) if (held(target, r.RoleId)) remove.push(r.RoleId);
-
-      if (arg) {
-        const e = this.find(arg);
-        if (!e || e.kind !== 'rank') return { ok: false, why: `no such rank: ${arg}` };
-        const id = idOf(e);
-        if (!id) return { ok: false, why: `the Discord role for ${arg} is missing` };
-        add.push(id);
-      }
-    } else if (op === 'leader.transfer') {
-      if (!actor) return { ok: false, why: 'nobody to hand it over from' };
-
-      const f = factionOf(actor);
-      if (!f) return { ok: false, why: 'you are not in a faction' };
-
-      const post = (f.Posts || []).find((p) => p.Slug === 'leader');
-      const id = post && !post.Missing ? post.RoleId : null;
-      if (!id) return { ok: false, why: `${f.Label} has no leader role` };
-      if (!held(actor, id)) return { ok: false, why: 'you are not the leader' };
-
-      const theirs = factionOf(target);
-      if (!theirs || theirs.Slug !== f.Slug) return { ok: false, why: `that player is not in ${f.Label}` };
-
-      // Given away, not shared. Handing leadership over and keeping it is
-      // not handing it over.
-      remove.push(id);
-      add.push(id);
-
-      try {
-        await actor.roles.remove(id, 'OpenZone: leadership handed over');
-        await target.roles.add(id, 'OpenZone: leadership handed over');
-        return { ok: true };
-      } catch (e) {
-        return { ok: false, why: this.#whyDiscordSaidNo(e) };
-      }
-    } else {
-      return { ok: false, why: `unknown operation: ${op}` };
-    }
-
-    try {
-      // Remove first. Setting a faction removes the old one, and doing that
-      // second on a member who briefly holds two makes resolve() answer
-      // "conflict" to anybody polling in between.
-      const drop = remove.filter((id) => id && held(target, id));
-      if (drop.length) await target.roles.remove(drop, 'OpenZone');
-
-      const gain = add.filter((id) => id && !held(target, id));
-      if (gain.length) await target.roles.add(gain, 'OpenZone');
-
-      return { ok: true };
-    } catch (e) {
-      return { ok: false, why: this.#whyDiscordSaidNo(e) };
-    }
-  }
-
-  // Discord's refusals, in words somebody can act on.
-  #whyDiscordSaidNo(e) {
-    if (e && e.code === 50013) {
-      return 'the bot cannot manage that role - move the bot role above it in Server Settings';
-    }
-    if (e && e.code === 50001) return 'the bot cannot see that member';
-    return (e && e.message) || 'Discord refused';
+    return parts.filter(
+      (x) => x.Factions.length || x.Ranks.length || x.Traits.length || x.Posts.length,
+    );
   }
 
   // What Discord says about one member, resolved onto the three axes.

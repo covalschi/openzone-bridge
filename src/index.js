@@ -322,7 +322,15 @@ function drain({ ServerId, Cursor, Uids, Fresh }) {
   // it again even though nothing changed.
   const stamp = roles.stamp();
   if (rosterSeen.get(ServerId) !== stamp) {
-    items.push({ Kind: 'roster', Json: JSON.stringify(roles.roster()) });
+    // Several items, one roster. A single big one does not survive the wire:
+    // the game gets the Json field TRUNCATED and says "Missing a closing
+    // quotation mark". Measured -- 805 bytes arrives, ~1200 does not.
+    //
+    // The pieces need no reassembly on the far side: ApplyRoster adds and
+    // updates and never deletes, so a roster in three parts is the roster.
+    for (const part of roles.rosterParts()) {
+      items.push({ Kind: 'roster', Json: JSON.stringify(part) });
+    }
     rosterSeen.set(ServerId, stamp);
   }
 
