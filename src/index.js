@@ -72,6 +72,11 @@ discord.useCodes(codes);
 const roles = new Roles(cfg.statePath.replace(/[^\\/]+$/, 'roles.json'));
 discord.useRoles(roles);
 
+// Реєстр мусить уміти спитати, чи прив'язаний акаунт: без цього роль на
+// комусь, хто ніколи не заходив у гру, рахувалась би як претензія на
+// лідерство й знімала б його з живого лідера.
+roles.useLinks((discordId) => !!store.steamIdOf(discordId));
+
 // Members of a conversation, as Discord ids, skipping whoever has not linked.
 function discordIdsOf(members) {
   return members.map((uid) => store.linkOf(uid)?.discordId).filter(Boolean);

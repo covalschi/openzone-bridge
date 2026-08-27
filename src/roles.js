@@ -190,6 +190,15 @@ export class Roles {
   //
   // Returns a report rather than logging: the caller is a slash command and
   // the person who ran it is waiting for an answer.
+  // Хто вміє сказати, чи прив'язаний цей акаунт Discord до SteamID.
+  //
+  // Ставиться ззовні, як і решта: реєстр не володіє таблицею прив'язок і не
+  // мусить -- вона живе в store, і тягнути її сюди означало б два доми для
+  // одного факту.
+  useLinks(isLinked) {
+    this.isLinked = isLinked;
+  }
+
   // Entries that have never been wired to a Discord role at all.
   //
   // Deliberately NOT the same as "has no RoleId": an entry the admin deleted
@@ -414,9 +423,34 @@ export class Roles {
 
     const holders = role.members;
     if (!holders || holders.size === 0) return this.#settled(faction);
-    if (holders.size === 1) return this.#settled(faction);
 
-    this.#sayContested(faction, holders);
+    // РАХУЄМО ЛИШЕ ПРИВ'ЯЗАНИХ.
+    //
+    // Роль на акаунті без SteamID у грі не важить нічого: гра питає про
+    // ЛЮДЕЙ У ЗОНІ, тобто про SteamID, і про непривязаного не спитає ніколи
+    // -- а ворота прив'язки й грати йому не дадуть. Такий держатель не
+    // суперник, він просто напис у Discord.
+    //
+    // Без цієї перевірки будь-хто з гільдії, хто ніколи не заходив у гру,
+    // одним лише фактом наявності ролі знімав би лідерство з живого лідера.
+    // Знайдено питанням власника через годину після того, як правило про
+    // двох лідерів було написано.
+    if (!this.isLinked)
+    {
+      // Не знаємо, хто прив'язаний -- не забираємо нічого. Те саме рішення,
+      // що й для холодного кешу: «не можу сказати» ніколи не мусить
+      // означати «відбираю».
+      if (!this.warnedNoLinks) {
+        this.warnedNoLinks = true;
+        console.warn('[roles] no link lookup wired -- the contested-leader rule is off');
+      }
+      return this.#settled(faction);
+    }
+
+    const linked = holders.filter((m) => this.isLinked(m.id));
+    if (linked.size <= 1) return this.#settled(faction);
+
+    this.#sayContested(faction, linked);
     return true;
   }
 
