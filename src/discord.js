@@ -732,11 +732,75 @@ export class DiscordSide {
   // --- notes ---
   //
   // Notes never touch the conversation index: a notebook thread is not a
-  // chat and must not show up in /v1/chat/list. These three helpers give
-  // the Notes module the same machinery conversations use, minus the index.
+  // chat and must not show up in /v1/chat/list. These helpers give the
+  // Notes module the same machinery conversations use, minus the index.
+  //
+  // Notebooks live in THEIR OWN channel, not the chat parent, and that is
+  // what makes them read-only: a thread has no permissions of its own, it
+  // inherits the channel -- so the chat parent must allow writing in
+  // threads (conversations!) while the notebook channel denies it. Only
+  // the bot and its webhook write there; a player sees their thread and
+  // cannot type into it. The owner asked for exactly this on 2026-08-28.
+
+  async ensureNotesChannel(knownId) {
+    const everyoneDeny = [
+      PermissionFlagsBits.SendMessages,
+      PermissionFlagsBits.SendMessagesInThreads,
+      PermissionFlagsBits.CreatePublicThreads,
+      PermissionFlagsBits.CreatePrivateThreads,
+      PermissionFlagsBits.AddReactions,
+    ];
+
+    let ch = null;
+    if (knownId) {
+      ch = await this.client.channels.fetch(knownId).catch(() => null);
+    }
+
+    if (!ch) {
+      // FETCH, not the cache -- the cache starts empty and an empty cache
+      // reads as "no such channel", which builds a duplicate.
+      const all = await this.guild.channels.fetch();
+      ch = all.find((c) => c && c.type === ChannelType.GuildText && c.name === 'нотатники');
+    }
+
+    if (!ch) {
+      ch = await this.guild.channels.create({
+        name: 'нотатники',
+        type: ChannelType.GuildText,
+        topic: 'Нотатники сталкерів. Читати можна, писати — ні: записки ведуться з КПК у грі.',
+        reason: 'OpenZone notebooks',
+      });
+    }
+
+    // Idempotent on purpose: an admin who loosened the channel by hand gets
+    // it tightened back on the next bridge start, because a writable
+    // notebook is a broken promise, not a configuration choice.
+    await ch.permissionOverwrites.set([
+      { id: this.guild.roles.everyone.id, deny: everyoneDeny },
+      {
+        id: this.client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.SendMessagesInThreads,
+          // The everyone-deny above binds the bot too unless re-allowed
+          // here -- measured: thread creation answered "Missing Access"
+          // until these two joined the list.
+          PermissionFlagsBits.CreatePrivateThreads,
+          PermissionFlagsBits.CreatePublicThreads,
+          PermissionFlagsBits.ManageThreads,
+          PermissionFlagsBits.ManageWebhooks,
+        ],
+      },
+    ]);
+
+    this.notesChannel = ch;
+    this.notesWebhook = await this.#webhookOn(ch);
+    return ch;
+  }
 
   async makeNoteThread(title, memberDiscordIds) {
-    const th = await this.parent.threads.create({
+    const th = await this.notesChannel.threads.create({
       name: title.slice(0, 90),
       type: ChannelType.PrivateThread,
       invitable: false,
@@ -745,6 +809,11 @@ export class DiscordSide {
     });
     await this.#invite(th, memberDiscordIds);
     return th;
+  }
+
+  async deleteThread(threadId, reason) {
+    const th = await this.client.channels.fetch(threadId).catch(() => null);
+    if (th) await th.delete(reason);
   }
 
   async fetchThread(threadId) {
@@ -758,10 +827,12 @@ export class DiscordSide {
   }
 
   // A webhook post un-archives the thread for free; the bot fallback posts
-  // plain content -- a note has no speaker line to reconstruct.
+  // plain content -- a note has no speaker line to reconstruct. The webhook
+  // is the NOTES channel's own: a webhook belongs to a channel, and the
+  // chat parent's one cannot reach threads of another channel.
   async postNote(threadId, name, content) {
-    if (this.webhook) {
-      return await this.webhook.send({
+    if (this.notesWebhook) {
+      return await this.notesWebhook.send({
         threadId,
         username: (name || 'stalker').slice(0, 80),
         content,
@@ -773,16 +844,33 @@ export class DiscordSide {
   }
 
   async deleteNoteMessage(threadId, messageId) {
-    if (this.webhook) {
+    if (this.notesWebhook) {
       try {
-        await this.webhook.deleteMessage(messageId, threadId);
+        await this.notesWebhook.deleteMessage(messageId, threadId);
         return;
       } catch {
-        // Not a webhook message (bot fallback posted it) -- delete as bot.
+        // Not a webhook message (bot fallback, or the chat-parent webhook
+        // from before notebooks moved) -- delete as the bot.
       }
     }
     const th = await this.client.channels.fetch(threadId);
     await th.messages.delete(messageId);
+  }
+
+  // The channel-bound twin of #ensureWebhook.
+  async #webhookOn(channel) {
+    try {
+      const hooks = await channel.fetchWebhooks();
+      const mine = hooks.find((h) => h.owner?.id === this.client.user.id);
+      if (mine) return mine;
+      return await channel.createWebhook({
+        name: 'OpenZone',
+        reason: 'posts notebook entries under each stalker own name',
+      });
+    } catch (err) {
+      console.warn(`[discord] no webhook on #${channel.name} (${err.message}); the bot posts plainly`);
+      return null;
+    }
   }
 
   async #invite(thread, discordIds) {

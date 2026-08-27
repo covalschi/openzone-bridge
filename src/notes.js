@@ -182,19 +182,43 @@ export class Notes {
     }
   }
 
-  // The title carries the note; the body follows. Bold title mirrors how a
-  // notebook page looks in game.
+  // The title carries the note; the body follows; the rule closes it.
+  //
+  // Without the rule, Discord groups quick posts by one author into a
+  // single visual block and three notes read as one text -- the owner saw
+  // exactly that and asked for a delimiter after every note.
   #render(item) {
     const head = item.Title ? `**${item.Title}**` : '**...**';
-    return item.Body ? `${head}\n${item.Body}` : head;
+    const text = item.Body ? `${head}\n${item.Body}` : head;
+    return `${text}\n──────────────`;
   }
 
   async #thread(uid, name) {
     const p = this.#of(uid);
 
+    // The notebook channel is lazy: the first note anywhere creates it,
+    // every later call finds it by the remembered id.
+    if (!this.discord.notesChannel) {
+      await this.discord.ensureNotesChannel(this.#data.channelId);
+      this.#data.channelId = this.discord.notesChannel.id;
+      this.#save();
+    }
+
     if (p.threadId) {
       const th = await this.discord.fetchThread(p.threadId);
-      if (th) return th;
+      if (th && th.parentId === this.discord.notesChannel.id) return th;
+
+      if (th) {
+        // The notebook lives under the wrong parent -- the chat channel,
+        // from before notebooks got their own read-only home. Threads
+        // cannot move between channels, so the notebook is REPOSTED: new
+        // thread in the right channel, every note again, old thread gone.
+        console.log(`[notes] moving the notebook of ${uid} to #нотатники`);
+        const moved = await this.#repostAll(uid, name, p);
+        await this.discord.deleteThread(th.id, 'notebook moved to its read-only channel');
+        return moved;
+      }
+
       // Thread deleted in Discord: the notes it held are gone with it.
       console.warn(`[notes] thread of ${uid} is gone; notes start over`);
       p.items = [];
@@ -207,6 +231,25 @@ export class Notes {
       discordId ? [discordId] : [],
     );
     p.threadId = th.id;
+    this.#save();
+    return th;
+  }
+
+  // New thread in the notes channel, every note posted afresh. Message ids
+  // change -- that is why the note Id was never the message id.
+  async #repostAll(uid, name, p) {
+    const discordId = this.store?.linkOf?.(uid)?.discordId;
+    const th = await this.discord.makeNoteThread(
+      `Нотатник — ${name || uid}`,
+      discordId ? [discordId] : [],
+    );
+    p.threadId = th.id;
+
+    for (const item of p.items) {
+      const msg = await this.discord.postNote(th.id, name, this.#render(item));
+      item.MsgId = msg.id;
+    }
+
     this.#save();
     return th;
   }
