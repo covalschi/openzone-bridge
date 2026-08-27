@@ -391,6 +391,61 @@ export class Roles {
     );
   }
 
+  // Is this post held by more than one member of the guild.
+  //
+  // ONLY THE LEADER POST is unique. A faction may have any number of guards
+  // or professors, and refusing to answer for those would break something
+  // that was never broken. "leader" is already the one slug the code treats
+  // specially -- IsLeader() in the game, the hand-over rule above -- so this
+  // is one more place it means the same thing, not a new convention. The day
+  // a second unique post is wanted, this is where it becomes a field on the
+  // post instead of a slug test.
+  //
+  // Counted from the member cache, which is warmed at start-up and kept
+  // honest by the gateway. A cold cache would under-count and quietly hand
+  // authority to whoever was cached -- so an EMPTY count is treated as "we
+  // cannot tell", and we leave the post alone rather than guess.
+  #contested(member, faction, post) {
+    if (post.Slug !== 'leader') return false;
+    if (!post.RoleId) return false;
+
+    const role = member.guild?.roles?.cache?.get(post.RoleId);
+    if (!role) return false;
+
+    const holders = role.members;
+    if (!holders || holders.size === 0) return this.#settled(faction);
+    if (holders.size === 1) return this.#settled(faction);
+
+    this.#sayContested(faction, holders);
+    return true;
+  }
+
+  // Back to one holder (or none). Forget what we warned about, so the SAME
+  // pair contesting it again a week later is reported again instead of being
+  // silently swallowed as "already said that".
+  #settled(faction) {
+    if (this.contested) this.contested.delete(faction.Slug);
+    return false;
+  }
+
+  // Said ONCE per change, not once per poll. The projection is resolved
+  // several times a minute for every online player, and a line each time
+  // would bury the one that matters.
+  #sayContested(faction, holders) {
+    this.contested ||= new Map();
+
+    const names = holders.map((m) => m.user?.tag || m.id).sort();
+    const key = names.join(',');
+
+    if (this.contested.get(faction.Slug) === key) return;
+    this.contested.set(faction.Slug, key);
+
+    console.warn(
+      `[roles] ${faction.Label}: ${holders.size} members hold the leader role ` +
+        `(${names.join(', ')}) - nobody leads it until one of them gives it up`,
+    );
+  }
+
   // What Discord says about one member, resolved onto the three axes.
   //
   // The conflict rules differ ON PURPOSE and both are stated here rather than
@@ -420,10 +475,26 @@ export class Roles {
 
     // Posts only count inside the faction actually held. A Duty leader badge
     // on somebody who is not in Duty means nothing.
+    //
+    // AND A CONTESTED LEADER POST COUNTS FOR NOBODY. Same rule as the faction
+    // above, for the same reason: two people holding it is a mistake in the
+    // guild, not a state of either player, and picking one of them would hide
+    // the mistake behind something that looks like it works.
+    //
+    // It matters more here than it looks. Faction feeds hostility; the leader
+    // post feeds AUTHORITY OVER PEOPLE -- two leaders can expel each other's
+    // members and each hand the faction to a third party, and whoever clicks
+    // first wins. The game already refuses to let a leader grant the leader
+    // post ("handed over, never handed out"); assigning it twice in Discord
+    // walked around that fence from the other side.
     const posts = [];
     if (faction) {
       const f = this.data.Factions.find((x) => x.Slug === faction);
-      for (const p of f.Posts || []) if (has(p.RoleId)) posts.push(p.Slug);
+      for (const p of f.Posts || []) {
+        if (!has(p.RoleId)) continue;
+        if (this.#contested(member, f, p)) continue;
+        posts.push(p.Slug);
+      }
     }
 
     const traits = this.data.Traits.filter((t) => has(t.RoleId)).map((t) => t.Slug);
