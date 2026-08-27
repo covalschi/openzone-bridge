@@ -97,3 +97,33 @@ const bad = await fetch(BASE + '/v1/chat/list', {
   body: JSON.stringify({ Secret: 'nope', ServerId: SERVER, Json: { Uid: A.uid } }),
 });
 ok('403', bad.status === 403);
+
+console.log('--- notes: Discord is the truth ---');
+const savedNote = await call('/v1/notes/save', {
+  Uid: A.uid, Id: '', Title: 'Тайник', Body: 'два ящики 5.45 пiд пiдлогою', Name: A.name,
+});
+ok('note saved, bridge minted its own id', !!savedNote.Id, savedNote.Id);
+
+const book1 = await call('/v1/notes/list', { Uid: A.uid });
+const mine = (book1.Notes || []).find((n) => n.Id === savedNote.Id);
+ok('note is in the book with its body', !!mine && mine.Body.includes('5.45'));
+
+const resaved = await call('/v1/notes/save', {
+  Uid: A.uid, Id: savedNote.Id, Title: 'Тайник', Body: 'ПЕРЕПИСАНО', Name: A.name,
+});
+ok('resave keeps the id (delete+post, no duplicate)', resaved.Id === savedNote.Id);
+
+const book2 = await call('/v1/notes/list', { Uid: A.uid });
+const after = (book2.Notes || []).filter((n) => n.Id === savedNote.Id);
+ok('still exactly one note', after.length === 1 && after[0].Body === 'ПЕРЕПИСАНО');
+
+ok('a stranger sees an empty book', ((await call('/v1/notes/list', { Uid: B.uid })).Notes || []).every((n) => n.Id !== savedNote.Id));
+
+const ghost = await call('/v1/notes/save', { Uid: A.uid, Id: 'no-such-id', Title: 'x', Body: 'y', Name: A.name });
+ok('editing a missing note is refused, not created', ghost.Error === 'no_note');
+
+const gone = await call('/v1/notes/delete', { Uid: A.uid, Id: savedNote.Id });
+ok('note deleted', gone.ok === true);
+
+const book3 = await call('/v1/notes/list', { Uid: A.uid });
+ok('book no longer holds it', (book3.Notes || []).every((n) => n.Id !== savedNote.Id));

@@ -19,6 +19,7 @@ import { HttpSide } from './http.js';
 import { OAuthSide } from './oauth.js';
 import { LinkCodes } from './codes.js';
 import { Roles } from './roles.js';
+import { Notes } from './notes.js';
 
 function need(name) {
   const v = process.env[name];
@@ -76,6 +77,12 @@ discord.useRoles(roles);
 // комусь, хто ніколи не заходив у гру, рахувалась би як претензія на
 // лідерство й знімала б його з живого лідера.
 roles.useLinks((discordId) => !!store.steamIdOf(discordId));
+
+// The notebook. Discord is the truth for it, same doctrine as chat -- the
+// owner's decision of 2026-08-28, restoring the thin-client spec as written.
+const notes = new Notes(cfg.statePath.replace(/[^\/]+$/, 'notes.json'));
+notes.use(discord, store);
+discord.onNoteMessageDeleted = (channelId, messageId) => notes.onMessageDeleted(channelId, messageId);
 
 // Members of a conversation, as Discord ids, skipping whoever has not linked.
 function discordIdsOf(members) {
@@ -170,6 +177,22 @@ const routes = {
     // means in practice.
     await discord.say(c.threadId, name, text, uid);
     return { ok: true };
+  },
+
+  // --- notes ---
+  //
+  // The answers wear the same shapes the game's page already parses
+  // (OZ_NoteBook and OZ_NoteRef): one description of the data, not two.
+  '/v1/notes/list': async ({ Json }) => notes.list(Json.Uid),
+
+  '/v1/notes/save': async ({ Json }) => {
+    const { Uid: uid, Id: id, Title: title, Body: body, Name: name } = Json;
+    return await notes.save(uid, id, title, body, name);
+  },
+
+  '/v1/notes/delete': async ({ Json }) => {
+    const { Uid: uid, Id: id } = Json;
+    return await notes.remove(uid, id);
   },
 
   // --- account link ---

@@ -51,6 +51,10 @@ export class DiscordSide {
     });
 
     this.client.on('messageCreate', (m) => this.#incoming(m));
+    // Notes follow Discord: a deleted message means a deleted note.
+    this.client.on('messageDelete', (m) => {
+      if (m?.channelId && m?.id) this.onNoteMessageDeleted?.(m.channelId, m.id);
+    });
 
     // МЕЖА ПОМИЛОК, і вона тут не про охайність.
     //
@@ -723,6 +727,62 @@ export class DiscordSide {
 
     await this.#invite(th, memberDiscordIds);
     return th;
+  }
+
+  // --- notes ---
+  //
+  // Notes never touch the conversation index: a notebook thread is not a
+  // chat and must not show up in /v1/chat/list. These three helpers give
+  // the Notes module the same machinery conversations use, minus the index.
+
+  async makeNoteThread(title, memberDiscordIds) {
+    const th = await this.parent.threads.create({
+      name: title.slice(0, 90),
+      type: ChannelType.PrivateThread,
+      invitable: false,
+      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
+      reason: 'OpenZone notebook',
+    });
+    await this.#invite(th, memberDiscordIds);
+    return th;
+  }
+
+  async fetchThread(threadId) {
+    try {
+      const th = await this.client.channels.fetch(threadId);
+      if (th?.archived) await th.setArchived(false);
+      return th;
+    } catch {
+      return null;
+    }
+  }
+
+  // A webhook post un-archives the thread for free; the bot fallback posts
+  // plain content -- a note has no speaker line to reconstruct.
+  async postNote(threadId, name, content) {
+    if (this.webhook) {
+      return await this.webhook.send({
+        threadId,
+        username: (name || 'stalker').slice(0, 80),
+        content,
+        allowedMentions: { parse: [] },
+      });
+    }
+    const th = await this.client.channels.fetch(threadId);
+    return await th.send({ content, allowedMentions: { parse: [] } });
+  }
+
+  async deleteNoteMessage(threadId, messageId) {
+    if (this.webhook) {
+      try {
+        await this.webhook.deleteMessage(messageId, threadId);
+        return;
+      } catch {
+        // Not a webhook message (bot fallback posted it) -- delete as bot.
+      }
+    }
+    const th = await this.client.channels.fetch(threadId);
+    await th.messages.delete(messageId);
   }
 
   async #invite(thread, discordIds) {
