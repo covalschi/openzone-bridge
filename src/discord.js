@@ -34,7 +34,9 @@ export class DiscordSide {
     // learn after it, because the gateway regularly hands the echo back while
     // the REST call that created it is still in flight -- measured at both
     // orders on the same guild. An id learned too late attributes nothing.
-    this.pending = new Map();
+    // Lines sent to Discord whose echo has not come back yet, oldest first.
+    // An array, not a map: the claim ladder searches it four different ways.
+    this.pending = [];
 
     this.client = new Client({
       intents: [
@@ -675,7 +677,12 @@ export class DiscordSide {
 
     // Ours if we are the ones who sent it. Otherwise, whoever typed it in
     // Discord, if that account is linked to a stalker.
-    let uid = this.#claim(m.channel.id, who, text);
+    //
+    // A webhook echo can only be a line WE sent, so it is allowed the loose
+    // tiers of the ladder; a human-typed message must match exactly or not
+    // at all -- misattributing a stranger's line is worse than dropping ours.
+    const ours = !!m.webhookId || m.author.id === this.client.user.id;
+    let uid = this.#claim(m.channel.id, who, text, ours);
     if (!uid && !m.webhookId) uid = this.store.steamIdOf(m.author.id);
 
     this.onMessage(convo.key, {
@@ -767,34 +774,58 @@ export class DiscordSide {
     }
   }
 
-  static #slot(threadId, who, text) {
-    return `${threadId}\u0000${who}\u0000${text}`;
-  }
-
   #expect(threadId, who, text, uid) {
-    const slot = DiscordSide.#slot(threadId, who, text);
-    const queue = this.pending.get(slot) || [];
-    queue.push(uid);
-    this.pending.set(slot, queue);
+    const entry = { threadId, who, text, uid };
+    this.pending.push(entry);
 
     // A send that never echoes must not leave its claim behind, or the next
     // identical line would collect it and be attributed to the wrong stalker.
     setTimeout(() => {
-      const q = this.pending.get(slot);
-      if (!q) return;
-      const at = q.indexOf(uid);
-      if (at >= 0) q.splice(at, 1);
-      if (q.length === 0) this.pending.delete(slot);
+      const at = this.pending.indexOf(entry);
+      if (at >= 0) this.pending.splice(at, 1);
     }, 60_000).unref?.();
   }
 
-  #claim(threadId, who, text) {
-    const slot = DiscordSide.#slot(threadId, who, text);
-    const queue = this.pending.get(slot);
-    if (!queue?.length) return null;
-    const uid = queue.shift();
-    if (queue.length === 0) this.pending.delete(slot);
-    return uid;
+  // Recognise the echo of a line we sent, and hand back who said it.
+  //
+  // This used to be ONE exact key: thread + name + text. It looked airtight
+  // and it lost lines in the field: Discord is free to normalise both halves
+  // of a webhook post -- trim trailing whitespace in the content, adjust a
+  // username it dislikes -- and any single changed character turned the
+  // player's own message into a stranger's. Nothing said why; the line just
+  // rendered as not-theirs.
+  //
+  // So for OUR OWN webhook echoes the match is a ladder, strict to loose:
+  // exact -> same thread+text (name normalised) -> same thread+name (text
+  // normalised) -> same thread, oldest first (both normalised; sends are
+  // awaited one at a time, so Discord echoes in send order). Every loose
+  // tier is logged: the day the normalisation changes, the log says so.
+  //
+  // Messages a human typed (loose=false) still match only exactly: for them
+  // a wrong match is worse than no match.
+  #claim(threadId, who, text, loose) {
+    let at = this.pending.findIndex((e) => e.threadId === threadId && e.who === who && e.text === text);
+    let tier = 'exact';
+
+    if (at < 0 && loose) {
+      at = this.pending.findIndex((e) => e.threadId === threadId && e.text === text);
+      tier = 'name-normalised';
+    }
+    if (at < 0 && loose) {
+      at = this.pending.findIndex((e) => e.threadId === threadId && e.who === who);
+      tier = 'text-normalised';
+    }
+    if (at < 0 && loose) {
+      at = this.pending.findIndex((e) => e.threadId === threadId);
+      tier = 'thread-order';
+    }
+    if (at < 0) return null;
+
+    const [entry] = this.pending.splice(at, 1);
+    if (tier !== 'exact') {
+      console.log(`[discord] echo matched via ${tier} tier (thread ${threadId}); Discord normalised something`);
+    }
+    return entry.uid;
   }
 
   async displayName(discordId) {
