@@ -177,6 +177,15 @@ export class DiscordSide {
                   type: 1, // SUB_COMMAND
                 },
                 {
+                  name: 'limit',
+                  description: 'Cap how many players a faction may take in',
+                  type: 1, // SUB_COMMAND
+                  options: [
+                    { name: 'slug', description: 'The faction, e.g. duty', type: 3, required: true },
+                    { name: 'size', description: 'Maximum members, or 0 for no limit', type: 4, required: true },
+                  ],
+                },
+                {
                   name: 'rename',
                   description: 'Rename one role, in Discord and in the roster',
                   type: 1, // SUB_COMMAND
@@ -540,7 +549,13 @@ export class DiscordSide {
         let mark = '--';
         if (e.node.RoleId) mark = '<@&' + e.node.RoleId + '>';
         if (e.node.Missing) mark = '(deleted in Discord)';
-        lines.push('`' + e.slug + '` ' + mark);
+
+        let cap = '';
+        if (e.kind === 'faction' && e.node.Limit > 0) {
+          cap = '  ' + this.roles.sizeOf(i.guild, e.slug) + '/' + e.node.Limit;
+        }
+
+        lines.push('`' + e.slug + '` ' + mark + cap);
       }
       await i.reply({ content: lines.join('\n').slice(0, 1900), flags: MessageFlags.Ephemeral });
       return;
@@ -570,6 +585,31 @@ export class DiscordSide {
       this.commandChannelId = null;
       this.store.setGuildRef('commandChannelId', null);
       await i.reply({ content: 'Більше не спрямовую. Канал лишився на місці.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (group === 'roles' && sub === 'limit') {
+      const slug = i.options.getString('slug');
+      const size = i.options.getInteger('size');
+
+      const r = this.roles.setLimit(slug, size);
+      if (!r.ok) {
+        await i.reply({ content: r.why, flags: MessageFlags.Ephemeral });
+        return;
+      }
+
+      // Кажемо, скільки ВЖЕ є: ліміт, поставлений нижче за поточний склад,
+      // нікого не виганяє -- він лише перекриває набір, -- і адмін мусить
+      // побачити це одразу, а не з'ясовувати з чужих скарг.
+      const now = this.roles.sizeOf(i.guild, slug);
+
+      let said = `\`${slug}\`: no limit`;
+      if (r.limit > 0) said = `\`${slug}\`: at most ${r.limit} (currently ${now})`;
+      if (r.limit > 0 && now > r.limit) {
+        said += ` -- already over. Nobody is removed; the faction just takes no more.`;
+      }
+
+      await i.reply({ content: said, flags: MessageFlags.Ephemeral });
       return;
     }
 
