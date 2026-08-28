@@ -113,9 +113,15 @@ export class Store {
     this.save();
   }
 
+  // The zone conversation belongs to everyone: its member list is ['*'],
+  // and every membership question in the bridge goes through here.
+  static memberOf(c, steamId) {
+    return c.members.includes('*') || c.members.includes(steamId);
+  }
+
   convosOf(steamId) {
     return Object.entries(this.data.convos)
-      .filter(([, c]) => c.members.includes(steamId))
+      .filter(([, c]) => Store.memberOf(c, steamId))
       .map(([key, c]) => ({ key, ...c }));
   }
 
@@ -153,7 +159,7 @@ export class Store {
     const out = [];
     for (const [key, list] of Object.entries(this.data.messages)) {
       const c = this.data.convos[key];
-      if (!c || !c.members.includes(steamId)) continue;
+      if (!c || !Store.memberOf(c, steamId)) continue;
       for (const m of list) {
         if (m.cursor > cursor) out.push({ key, ...m });
       }

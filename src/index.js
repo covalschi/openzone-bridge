@@ -20,6 +20,7 @@ import { OAuthSide } from './oauth.js';
 import { LinkCodes } from './codes.js';
 import { Roles } from './roles.js';
 import { Notes } from './notes.js';
+import { News } from './news.js';
 
 function need(name) {
   const v = process.env[name];
@@ -106,7 +107,11 @@ const routes = {
 
   '/v1/chat/list': async ({ Json }) => {
     const { Uid: uid } = Json;
-    const items = store.convosOf(uid).map((c) => {
+    // The zone pins itself on top: it is the one conversation everybody
+    // has, and burying it under private ones would hide the town square.
+    const items = store.convosOf(uid)
+      .sort((a, b) => (a.kind === 'zone' ? -1 : 0) - (b.kind === 'zone' ? -1 : 0))
+      .map((c) => {
       const tail = store.messagesOf(c.key, 1)[0];
       return {
         Id: c.key,
@@ -122,13 +127,13 @@ const routes = {
   '/v1/chat/open': async ({ Json }) => {
     const { Uid: uid, Id: key, Limit: limit } = Json;
     const c = store.convo(key);
-    if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
+    if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
 
     return {
       Id: key,
       Kind: c.kind,
       Title: c.title,
-      Members: c.members.map((m) => store.linkOf(m)?.discordName || m),
+      Members: c.kind === 'zone' ? [] : c.members.map((m) => store.linkOf(m)?.discordName || m),
       Lines: store.messagesOf(key, limit || 50).map((m) => ({
         At: m.at,
         Who: m.who,
@@ -168,9 +173,23 @@ const routes = {
   },
 
   '/v1/chat/send': async ({ Json }) => {
-    const { Uid: uid, Name: name, Id: key, Text: text } = Json;
+    const { Uid: uid, Name: name, Id: key, Text: text, Anon: anon } = Json;
     const c = store.convo(key);
-    if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
+    if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
+
+    // ANONYMOUS is a zone-chat right, not a general one: in a private
+    // conversation the other side chose WHO they talk to, and stripping
+    // the name there would break that choice. In the zone anyone may
+    // shout into the dark -- the owner asked for exactly this.
+    //
+    // Anonymity means the echo is claimed by nobody: no expect is filed,
+    // the stored line keeps uid null, and even the sender's own device
+    // shows it as not-theirs. Deniability is the point. The real sender
+    // is in the game server's log, nowhere else.
+    if (anon && c.kind === 'zone') {
+      await discord.say(c.threadId, 'Невідомий сталкер', text, null);
+      return { ok: true };
+    }
 
     // Sent, not stored. It becomes part of the conversation when Discord
     // hands it back over the gateway — that is what "Discord is the truth"
@@ -194,6 +213,10 @@ const routes = {
     const { Uid: uid, Id: id } = Json;
     return await notes.remove(uid, id);
   },
+
+  // --- news ---
+  '/v1/news/list': async () => news.list(),
+  '/v1/news/open': async ({ Json }) => news.open(Json.Id),
 
   // --- account link ---
 
@@ -433,5 +456,51 @@ http = new HttpSide(cfg, {
 });
 
 await discord.start();
+
+const news = new News();
+
+// Typed homes for threads: direct talks and groups each get their own
+// channel; the ids live in the bridge state so a rename survives.
+{
+  const d = await discord.ensureTypedChannel(
+    'пда-розмови',
+    'Особисті розмови з КПК. Пишіть у своїх тредах — сам канал порожній.',
+    store.guildRef?.('directChannelId'),
+  );
+  discord.directChannel = d;
+  store.setGuildRef?.('directChannelId', d.id);
+
+  const g = await discord.ensureTypedChannel(
+    'пда-групи',
+    'Групові розмови з КПК. Пишіть у своїх тредах — сам канал порожній.',
+    store.guildRef?.('groupChannelId'),
+  );
+  discord.groupChannel = g;
+  store.setGuildRef?.('groupChannelId', g.id);
+}
+
+// The zone exists from the first boot: one conversation for everyone,
+// members ['*'] -- the wildcard Store.memberOf understands.
+{
+  const known = store.convo('zone');
+  const ch = await discord.ensureZoneChannel(known?.threadId);
+  if (!known || known.threadId !== ch.id) {
+    // The first cut of the zone was a public thread; a stray one is
+    // deleted rather than left as a second town square.
+    if (known?.threadId) {
+      await discord.deleteThread(known.threadId, 'the zone moved to its own channel').catch(() => {});
+    }
+    store.putConvo('zone', {
+      threadId: ch.id, // the channel id rides in the thread field: convoByThread keeps working
+      kind: 'zone',
+      title: 'Зона',
+      members: ['*'],
+      createdAt: known?.createdAt || new Date().toISOString(),
+    });
+  }
+}
+
+await news.start(discord, store.guildRef?.('newsChannelId')).then((ch) => store.setGuildRef?.('newsChannelId', ch.id));
+
 await http.listen();
 console.log('[bridge] ready');

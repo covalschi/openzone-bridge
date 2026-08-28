@@ -659,8 +659,9 @@ export class DiscordSide {
   // because the store, not this handler, decides what is a duplicate. That
   // way a message reaches the game only once Discord actually has it.
   #incoming(m) {
-    if (!m.channel?.isThread?.()) return;
-
+    // No thread gate: the zone is a plain channel, and convoByThread is the
+    // real question -- a message either belongs to a conversation we carry
+    // or it does not.
     const convo = this.store.convoByThread(m.channel.id);
     if (!convo) return;
 
@@ -717,7 +718,8 @@ export class DiscordSide {
       }
     }
 
-    const th = await this.parent.threads.create({
+    const home = this.homeOf(key.startsWith('g:') ? 'group' : 'direct');
+    const th = await home.threads.create({
       name: title.slice(0, 90),
       type: ChannelType.PrivateThread,
       invitable: false,
@@ -741,6 +743,85 @@ export class DiscordSide {
   // threads (conversations!) while the notebook channel denies it. Only
   // the bot and its webhook write there; a player sees their thread and
   // cannot type into it. The owner asked for exactly this on 2026-08-28.
+
+  // --- typed thread homes ---
+  //
+  // The owner asked for separate channels per thread TYPE (2026-08-28):
+  // direct conversations in one, groups in another, notebooks and the zone
+  // already have their own, news will too. The channels stay EMPTY on
+  // purpose -- people write inside their threads, never into the channel --
+  // so @everyone loses SendMessages and thread creation, but keeps
+  // SendMessagesInThreads: a conversation you are in is yours to write in.
+  //
+  // Old threads stay where they were born: a thread cannot move, and the
+  // webhook is resolved by the thread's PARENT, so both eras keep working.
+
+  async ensureTypedChannel(name, topic, knownId) {
+    let ch = null;
+    if (knownId) ch = await this.client.channels.fetch(knownId).catch(() => null);
+
+    if (!ch) {
+      const all = await this.guild.channels.fetch();
+      ch = all.find((c) => c && c.type === ChannelType.GuildText && c.name === name);
+    }
+
+    if (!ch) {
+      ch = await this.guild.channels.create({
+        name,
+        type: ChannelType.GuildText,
+        topic,
+        parent: this.parent.parentId ?? undefined,
+        reason: 'OpenZone typed thread home',
+      });
+    }
+
+    await ch.permissionOverwrites.set([
+      {
+        id: this.guild.roles.everyone.id,
+        deny: [
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.CreatePublicThreads,
+          PermissionFlagsBits.CreatePrivateThreads,
+        ],
+        allow: [PermissionFlagsBits.SendMessagesInThreads],
+      },
+      {
+        id: this.client.user.id,
+        allow: [
+          PermissionFlagsBits.ViewChannel,
+          PermissionFlagsBits.SendMessages,
+          PermissionFlagsBits.SendMessagesInThreads,
+          PermissionFlagsBits.CreatePrivateThreads,
+          PermissionFlagsBits.CreatePublicThreads,
+          PermissionFlagsBits.ManageThreads,
+          PermissionFlagsBits.ManageWebhooks,
+        ],
+      },
+    ]);
+
+    this.hookByChannel ??= new Map();
+    if (!this.hookByChannel.has(ch.id)) {
+      this.hookByChannel.set(ch.id, await this.#webhookOn(ch));
+    }
+    return ch;
+  }
+
+  // Where a conversation of this kind is born.
+  homeOf(kind) {
+    if (kind === 'group' && this.groupChannel) return this.groupChannel;
+    if (this.directChannel) return this.directChannel;
+    return this.parent;
+  }
+
+  // The webhook that can reach a thread: its parent channel's own, with the
+  // chat parent's webhook as the fallback for threads born before the split.
+  async hookFor(threadId) {
+    const th = await this.client.channels.fetch(threadId).catch(() => null);
+    if (th?.parentId && this.hookByChannel?.has(th.parentId)) {
+      return this.hookByChannel.get(th.parentId);
+    }
+    return this.webhook;
+  }
 
   async ensureNotesChannel(knownId) {
     const everyoneDeny = [
@@ -796,6 +877,44 @@ export class DiscordSide {
 
     this.notesChannel = ch;
     this.notesWebhook = await this.#webhookOn(ch);
+    return ch;
+  }
+
+  // The zone: ONE public text channel. A channel, not a thread, on purpose:
+  // a thread must be joined to be followed and archives itself after a
+  // quiet week; a channel simply sits in the list, which is what a town
+  // square is. Everybody reads and writes it, from the game and from
+  // Discord alike. It carries its own webhook -- a webhook belongs to a
+  // channel, and the chat parent's one cannot post outside its threads.
+  async ensureZoneChannel(knownId) {
+    let ch = null;
+    if (knownId) {
+      ch = await this.client.channels.fetch(knownId).catch(() => null);
+      // The first cut of the zone was a THREAD, and its id may still be on
+      // file. A thread cannot carry a webhook and is not a town square:
+      // only a real text channel qualifies. Anything else falls through to
+      // the search below, and index.js then deletes the stray thread and
+      // stores the channel id in its place. Measured live: the stored id
+      // resolved to thread #Зона and every zone line posted plainly into it.
+      if (ch && ch.type !== ChannelType.GuildText) ch = null;
+    }
+
+    if (!ch) {
+      const all = await this.guild.channels.fetch();
+      ch = all.find((c) => c && c.type === ChannelType.GuildText && c.name === 'зона');
+    }
+
+    if (!ch) {
+      ch = await this.guild.channels.create({
+        name: 'зона',
+        type: ChannelType.GuildText,
+        topic: 'Спільний ефір Зони. Те, що сказано тут, чує кожен КПК.',
+        reason: 'OpenZone zone-wide chat',
+      });
+    }
+
+    this.zoneChannel = ch;
+    this.zoneWebhook = await this.#webhookOn(ch);
     return ch;
   }
 
@@ -897,8 +1016,26 @@ export class DiscordSide {
     if (uid) this.#expect(threadId, who, body, uid);
 
     try {
-      if (this.webhook) {
-        await this.webhook.send({
+      // The zone is a plain channel: its own webhook, no threadId.
+      if (this.zoneChannel && threadId === this.zoneChannel.id) {
+        if (this.zoneWebhook) {
+          await this.zoneWebhook.send({
+            username: who,
+            content: body,
+            allowedMentions: { parse: [] },
+          });
+        } else {
+          await this.zoneChannel.send({
+            content: `**${who}**: ${body}`,
+            allowedMentions: { parse: [] },
+          });
+        }
+        return;
+      }
+
+      const hook = await this.hookFor(threadId);
+      if (hook) {
+        await hook.send({
           threadId,
           username: who,
           content: body,
