@@ -17,9 +17,10 @@
 // against the global 50/s budget shared with chat; the cache pays once.
 
 import { ChannelType, PermissionFlagsBits } from 'discord.js';
+import { byteClip, GAME_STR_MAX } from './clip.js';
 
 const KEEP = 50;
-const BODY_MAX = 1500;
+const BODY_MAX = GAME_STR_MAX; // game JSON parse cap, see clip.js
 
 function stamp(ts) {
   return new Date(ts).toISOString().slice(0, 19).replace('T', ' ');
@@ -130,7 +131,7 @@ export class News {
     if (!known || warm || !post.Body) {
       try {
         const starter = await th.fetchStarterMessage();
-        post.Body = (starter?.content || '').slice(0, BODY_MAX);
+        post.Body = byteClip(starter?.content || '', BODY_MAX);
         post.Who = starter?.member?.displayName || starter?.author?.username || post.Who;
       } catch {
         // Starter deleted: the post keeps its title and an empty body.
@@ -149,7 +150,7 @@ export class News {
   #onStarter(m) {
     const p = this.posts.get(m.channelId);
     if (!p) return;
-    p.Body = (m.content || '').slice(0, BODY_MAX);
+    p.Body = byteClip(m.content || '', BODY_MAX);
     p.Who = m.member?.displayName || m.author?.username || p.Who;
   }
 

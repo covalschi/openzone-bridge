@@ -20,11 +20,15 @@
 // every chat line, and fifty notes per player have no business riding that.
 
 import fs from 'node:fs';
+import { byteClip, GAME_STR_MAX } from './clip.js';
 import path from 'node:path';
 
 const NOTES_MAX = 50;
 const TITLE_MAX = 64;
-const BODY_MAX = 1500;
+// GAME_STR_MAX, not more: the game's JSON parser truncates string values
+// at 1023 bytes (measured), so a taller ceiling is a promise the game
+// cannot keep. Clipping is by BYTES -- see clip.js.
+const BODY_MAX = GAME_STR_MAX;
 
 // The game's own timestamp shape ("2026-08-28 01:23:45"), so the client
 // renders bridge notes and legacy notes identically.
@@ -93,7 +97,7 @@ export class Notes {
     const p = this.#of(uid);
 
     title = String(title ?? '').slice(0, TITLE_MAX);
-    body = String(body ?? '').slice(0, BODY_MAX);
+    body = byteClip(body, BODY_MAX);
 
     let item;
     if (id) {

@@ -10,6 +10,7 @@
 // Discord account can still be heard. Linking buys reading and writing FROM
 // Discord; it is not the price of speaking in game.
 
+import { byteClip } from './clip.js';
 import {
   Client,
   GatewayIntentBits,
@@ -668,7 +669,9 @@ export class DiscordSide {
     // Ours by id first -- exact. Then by linked Discord account, for messages
     // a player typed in Discord rather than in game.
     let who = m.member?.displayName || m.author.username;
-    let text = m.content || '';
+    // Byte-clipped at the door: the game truncates any JSON string value at
+    // 1023 bytes when parsing, mid-character if we let it (see clip.js).
+    let text = byteClip(m.content || '');
 
     // Undo the fallback format, so the game shows the speaker in its own
     // column instead of a bold blob inside the line.
