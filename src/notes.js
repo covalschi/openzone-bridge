@@ -209,7 +209,17 @@ export class Notes {
     }
 
     if (p.threadId) {
-      const th = await this.discord.fetchThread(p.threadId);
+      const res = await this.discord.fetchThread(p.threadId);
+
+      // Discord did not answer clearly -- a 500, a timeout, a network
+      // blip. This is NOT proof the thread is gone, so we touch NOTHING
+      // and fail the save; the note keeps its place and the player retries.
+      // Wiping the index here on a transient error is data loss.
+      if (res.unsure) {
+        throw new Error(`discord unsure about the notebook thread: ${res.why || 'unknown'}`);
+      }
+
+      const th = res.thread;
       if (th && th.parentId === this.discord.notesChannel.id) return th;
 
       if (th) {
@@ -223,7 +233,7 @@ export class Notes {
         return moved;
       }
 
-      // Thread deleted in Discord: the notes it held are gone with it.
+      // Genuinely gone (10003/10004): the notes it held are gone with it.
       console.warn(`[notes] thread of ${uid} is gone; notes start over`);
       p.items = [];
       p.threadId = null;

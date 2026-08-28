@@ -942,13 +942,25 @@ export class DiscordSide {
     if (th) await th.delete(reason);
   }
 
+  // Three answers, never conflated -- the same discipline as #lookUp.
+  // A note book must NOT be wiped because Discord had a 500: `gone` is only
+  // 10003 Unknown Channel / 10004 Unknown/10008 Unknown Message-thread;
+  // every other failure is `unsure` and the caller must leave the index
+  // alone. Returning bare null (deleted) for a transient error is exactly
+  // how a routine hiccup used to erase a player's whole notebook.
   async fetchThread(threadId) {
     try {
       const th = await this.client.channels.fetch(threadId);
-      if (th?.archived) await th.setArchived(false);
-      return th;
-    } catch {
-      return null;
+      if (!th) return { gone: true };
+      if (th.archived) {
+        // Un-archiving can itself fail transiently; that is NOT proof the
+        // thread is gone, so a failure here still returns the thread.
+        try { await th.setArchived(false); } catch { /* keep the thread */ }
+      }
+      return { thread: th };
+    } catch (e) {
+      if (e && (e.code === 10003 || e.code === 10004)) return { gone: true };
+      return { unsure: true, why: e && e.message };
     }
   }
 
@@ -1020,7 +1032,14 @@ export class DiscordSide {
     const who = name.slice(0, 80);
     const body = text.slice(0, 1900);
 
-    if (uid) this.#expect(threadId, who, body, uid);
+    // Expect the echo of EVERY line we send, anonymous ones included. An
+    // anon send carries uid null, and if we filed no claim for it, its
+    // webhook echo fell through the ladder to the thread-order tier and
+    // stole an innocent player's still-pending line -- attributing the
+    // anonymous shout to them. Filing the claim with uid null makes the
+    // echo match itself exactly and resolve to null: nobody's, which is
+    // the whole point of anonymity.
+    this.#expect(threadId, who, body, uid ?? null);
 
     try {
       // The zone is a plain channel: its own webhook, no threadId.
@@ -1060,8 +1079,10 @@ export class DiscordSide {
       }
     } catch (err) {
       // Nothing was said, so nothing will echo. Drop the claim rather than
-      // leave it to be collected by the next identical line.
-      if (uid) this.#claim(threadId, who, body);
+      // leave it to be collected by the next identical line -- for anon
+      // sends too, or the abandoned null-claim would sit and swallow the
+      // next matching echo.
+      this.#claim(threadId, who, body, true);
       throw err;
     }
   }
