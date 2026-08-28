@@ -75,6 +75,10 @@ export class Notes {
     const p = this.#of(uid);
     return {
       Version: 1,
+      // The ceiling travels with the book: the carrier import in the game
+      // must know how much ROOM is left before it fires N saves, and the
+      // cap's authority is here, not in a constant the game hopes matches.
+      Max: NOTES_MAX,
       Notes: p.items.map((n) => ({
         Id: n.Id,
         Title: n.Title,
