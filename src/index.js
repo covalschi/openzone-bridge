@@ -145,6 +145,8 @@ const routes = {
 
   '/v1/chat/start': async ({ Json }) => {
     const { Uid: uid, Name: name, OtherUid: otherUid, OtherName: otherName } = Json;
+    store.rememberName(uid, name);
+    store.rememberName(otherUid, otherName);
     const key = Store.directKey(uid, otherUid);
     const c = store.convo(key);
     if (c) return { Id: key };
@@ -174,6 +176,7 @@ const routes = {
 
   '/v1/chat/send': async ({ Json }) => {
     const { Uid: uid, Name: name, Id: key, Text: text, Anon: anon } = Json;
+    store.rememberName(uid, name);
     const c = store.convo(key);
     if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
 
@@ -206,6 +209,7 @@ const routes = {
 
   '/v1/notes/save': async ({ Json }) => {
     const { Uid: uid, Id: id, Title: title, Body: body, Name: name } = Json;
+    store.rememberName(uid, name);
     return await notes.save(uid, id, title, body, name);
   },
 

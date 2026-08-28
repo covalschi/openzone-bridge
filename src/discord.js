@@ -688,7 +688,14 @@ export class DiscordSide {
     // at all -- misattributing a stranger's line is worse than dropping ours.
     const ours = !!m.webhookId || m.author.id === this.client.user.id;
     let uid = this.#claim(m.channel.id, who, text, ours);
-    if (!uid && !m.webhookId) uid = this.store.steamIdOf(m.author.id);
+    if (!uid && !m.webhookId) {
+      uid = this.store.steamIdOf(m.author.id);
+      // A linked stalker typing FROM Discord speaks under his game name:
+      // the Zone knows one identity, and the Discord nick is not it. The
+      // unlinked keep their Discord name -- an admin writing from outside
+      // is exactly that.
+      if (uid) who = this.store.nameOf(uid) || who;
+    }
 
     this.onMessage(convo.key, {
       id: m.id,

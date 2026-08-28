@@ -96,6 +96,24 @@ export class Store {
     return null;
   }
 
+  // ---- game names ----
+  //
+  // The last name a stalker wore IN GAME, remembered from his own requests.
+  // Needed the other way round: when a linked player types in Discord, the
+  // game must show his character, not his Discord nick.
+
+  rememberName(steamId, name) {
+    if (!steamId || !name) return;
+    this.data.names ??= {};
+    if (this.data.names[steamId] === name) return;
+    this.data.names[steamId] = name;
+    this.save();
+  }
+
+  nameOf(steamId) {
+    return (this.data.names ?? {})[steamId] || '';
+  }
+
   // ---- conversations ----
 
   // A direct conversation key is DERIVED from the two SteamIDs, so both sides
