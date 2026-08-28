@@ -13,6 +13,7 @@
 // simply not shown.
 
 import 'dotenv/config';
+import { byteClip } from './clip.js';
 import { Store } from './store.js';
 import { DiscordSide } from './discord.js';
 import { HttpSide } from './http.js';
@@ -21,6 +22,43 @@ import { LinkCodes } from './codes.js';
 import { Roles } from './roles.js';
 import { Notes } from './notes.js';
 import { News } from './news.js';
+import { Personas } from './personas.js';
+
+// Store timestamps are UTC written as "YYYY-MM-DD HH:MM:SS". Date.parse
+// reads a space-separated stamp as LOCAL time, which silently shifted the
+// history window by the machine's offset -- so the parse is explicit.
+function parseAt(at) {
+  const s = String(at);
+  // Two stamp dialects live in the index: the old writer kept the raw
+  // toISOString (with T and Z), the newer one writes "YYYY-MM-DD HH:MM:SS"
+  // in UTC. A parser that chokes on one of them returns 0, and 0 passes
+  // every window check at once -- measured live as "the whole history in
+  // one page".
+  const t = Date.parse(s.includes('T') ? s : s.replace(' ', 'T') + 'Z');
+  return Number.isFinite(t) ? t : 0;
+}
+
+// One 8-hour page of a message list, ending at `endMs` -- or, when that
+// window is empty, at the newest message before it, so a quiet stretch
+// falls through to the last page that HAS something.
+function windowSlice(list, endMs) {
+  const windowMs = 8 * 3600 * 1000;
+  if (!list.length) return [];
+
+  let end = endMs;
+  const inWindow = (m) => {
+    const t = parseAt(m.at);
+    return t <= end && t > end - windowMs;
+  };
+
+  if (!list.some(inWindow)) {
+    const newestBefore = [...list].reverse().find((m) => parseAt(m.at) <= end);
+    if (!newestBefore) return [];
+    end = parseAt(newestBefore.at);
+  }
+
+  return list.filter(inWindow);
+}
 
 function need(name) {
   const v = process.env[name];
@@ -43,6 +81,9 @@ const cfg = {
   // Under ten: see the note in http.js -- the game's request dies at 10 s.
   holdSeconds: Number(process.env.POLL_HOLD_SECONDS || 8),
   statePath: process.env.BRIDGE_STATE || './state/bridge.json',
+  // Optional: a Discord role that counts as bridge admin alongside the
+  // Administrator permission (personas, /openzone).
+  adminRoleId: process.env.DISCORD_ADMIN_ROLE_ID || '',
 };
 
 const store = new Store(cfg.statePath);
@@ -73,6 +114,8 @@ discord.useCodes(codes);
 // ids have no business riding that.
 const roles = new Roles(cfg.statePath.replace(/[^\\/]+$/, 'roles.json'));
 discord.useRoles(roles);
+const personas = new Personas('./state/personas.json');
+discord.usePersonas(personas);
 
 // Реєстр мусить уміти спитати, чи прив'язаний акаунт: без цього роль на
 // комусь, хто ніколи не заходив у гру, рахувалась би як претензія на
@@ -117,6 +160,7 @@ const routes = {
         Id: c.key,
         Kind: c.kind,
         Title: c.title,
+        Desc: c.desc || '',
         LastAt: tail?.at || '',
         LastText: tail?.text || '',
       };
@@ -129,18 +173,77 @@ const routes = {
     const c = store.convo(key);
     if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
 
+    // The default view is ONE 8-HOUR WINDOW, anchored to the conversation
+    // itself: the window ends at NOW when the talk is live, otherwise at the
+    // NEWEST message -- a quiet conversation still opens on its last page
+    // instead of an empty one. Everything older loads page by page through
+    // /older, each page one more 8-hour window.
+    const all = store.messagesOf(key, 1000);
+    const shown = windowSlice(all, Date.now());
+    const trimmed = all.length - shown.length;
+
     return {
       Id: key,
       Kind: c.kind,
       Title: c.title,
-      Members: c.kind === 'zone' ? [] : c.members.map((m) => store.linkOf(m)?.discordName || m),
-      Lines: store.messagesOf(key, limit || 50).map((m) => ({
+      Desc: c.desc || '',
+      // GAME names first: the Zone knows one identity, and the Discord nick
+      // is not it. The nick only fills in for people the game never saw.
+      Members: c.kind === 'zone' ? [] : c.members.map((m) => store.nameOf(m) || store.linkOf(m)?.discordName || m),
+      // Older exists if we trimmed anything here, or the store tail is at its
+      // cap (the thread very likely goes further back than we remember).
+      More: trimmed > 0 || all.length >= 100,
+      Before: shown[0]?.id || '',
+      Lines: shown.map((m) => ({
         At: m.at,
         Who: m.who,
         Text: m.text,
         Mine: m.uid === uid,
       })),
     };
+  },
+
+  // Older history, one page per call. Served from the store while it still
+  // has older lines, then from the Discord thread itself -- Discord is the
+  // truth and the only party that remembers past our tail.
+  '/v1/chat/older': async ({ Json }) => {
+    const { Uid: uid, Id: key, Before: before, Limit: limit } = Json;
+    const c = store.convo(key);
+    if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
+
+    const page = Math.min(limit || 50, 100);
+
+    // 1) the store tail first: the previous 8-hour window, anchored to the
+    // newest message OLDER than the current top -- a week-long silence is
+    // skipped in one step instead of seven empty pages.
+    const all = store.messagesOf(key, 1000);
+    let at = before ? all.findIndex((m) => m.id === before) : -1;
+    if (at > 0) {
+      const older = all.slice(0, at);
+      const chunk = windowSlice(older, parseAt(older[older.length - 1].at) + 1);
+      return {
+        Id: key,
+        More: older.length - chunk.length > 0 || !!c.threadId,
+        Before: chunk[0]?.id || before,
+        Lines: chunk.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: m.uid === uid })),
+      };
+    }
+
+    // 2) the thread itself
+    if (!c.threadId) return { Id: key, More: false, Before: before || '', Lines: [] };
+    try {
+      const lines = await discord.fetchOlder(c.threadId, before, page);
+      const my = store.nameOf(uid);
+      return {
+        Id: key,
+        More: lines.length === page,
+        Before: lines[0]?.id || before || '',
+        Lines: lines.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: my !== '' && m.who === my })),
+      };
+    } catch (err) {
+      console.warn(`[chat] older fetch failed: ${err.message}`);
+      return { Error: 'discord_down' };
+    }
   },
 
   '/v1/chat/start': async ({ Json }) => {
@@ -155,10 +258,89 @@ const routes = {
   },
 
   '/v1/chat/group_new': async ({ Json }) => {
-    const { Uid: uid, Title: title } = Json;
+    const { Uid: uid, Title: title, Desc: desc } = Json;
     const key = `g:${uid}:${Date.now().toString(36)}`;
     await startConversation(key, 'group', title || 'group', [uid]);
+    if (desc) {
+      const c = store.convo(key);
+      c.desc = byteClip(desc, 200);
+      store.putConvo(key, c);
+    }
     return { Id: key };
+  },
+
+  // Name and description of an existing group. Any member may edit: a group
+  // small enough to fit a PDA screen runs on trust, not on ownership.
+  '/v1/chat/group_edit': async ({ Json }) => {
+    const { Uid: uid, Id: key, Title: title, Desc: desc } = Json;
+    const c = store.convo(key);
+    if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
+    if (c.kind !== 'group') return { Error: 'not_group' };
+
+    if (title && title !== c.title) {
+      c.title = byteClip(title, 100);
+      // The thread wears the same name people see in game. A rename that
+      // fails in Discord is not fatal: the store is what the game lists.
+      try {
+        await discord.renameThread(c.threadId, c.title);
+      } catch (err) {
+        console.warn(`[chat] thread rename failed: ${err.message}`);
+      }
+    }
+    if (desc !== undefined) c.desc = byteClip(desc, 200);
+
+    store.putConvo(key, c);
+    return { ok: true };
+  },
+
+  // A group ends when a member ends it: index entry and tail go at once,
+  // and the thread follows -- the town square (zone) and direct talks have
+  // no delete on purpose.
+  '/v1/chat/group_del': async ({ Json }) => {
+    const { Uid: uid, Id: key } = Json;
+    const c = store.convo(key);
+    if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
+    if (c.kind !== 'group') return { Error: 'not_group' };
+
+    delete store.data.convos[key];
+    delete store.data.messages[key];
+    store.save();
+
+    if (c.threadId) {
+      try {
+        await discord.deleteThread(c.threadId, `group deleted by ${uid}`);
+      } catch (err) {
+        console.warn(`[chat] group thread delete failed: ${err.message}`);
+      }
+    }
+    return { ok: true };
+  },
+
+  // The PAGER: a one-way line from a scripted NPC to one player. The game
+  // server is the only caller (it holds the shared secret); the thread is
+  // the usual Discord truth, the webhook wears the NPC's name, and the
+  // conversation kind 'npc' makes every reader treat it as receive-only.
+  '/v1/npc/say': async ({ Json }) => {
+    const { NpcId: npcId, Name: npcName, Uid: uid, Text: text } = Json;
+    if (!npcId || !uid) return { Error: 'no_chat' };
+
+    const key = `npc:${npcId}:${uid}`;
+    let c = store.convo(key);
+    if (!c) {
+      await startConversation(key, 'npc', npcName || npcId, [uid]);
+      c = store.convo(key);
+    }
+    // The NPC may be renamed between mod versions; the pager follows.
+    if (npcName && c.title !== npcName) {
+      c.title = npcName;
+      store.putConvo(key, c);
+    }
+
+    // No expect is filed: the echo is claimed by nobody, the stored line
+    // keeps uid null, and the game shows the NPC's name in the Who column
+    // -- the same mechanics the anonymous zone shout uses.
+    await discord.say(c.threadId, npcName || npcId, byteClip(text), null);
+    return { ok: true };
   },
 
   '/v1/chat/group_add': async ({ Json }) => {
@@ -179,6 +361,11 @@ const routes = {
     store.rememberName(uid, name);
     const c = store.convo(key);
     if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
+
+    // The pager is one-way by design: NPC lines come in, nothing goes out.
+    // The game hides the input, and this is the fence for a client that
+    // did not.
+    if (c.kind === 'npc') return { Error: 'read_only' };
 
     // ANONYMOUS is a zone-chat right, not a general one: in a private
     // conversation the other side chose WHO they talk to, and stripping
@@ -504,6 +691,7 @@ const news = new News();
   }
 }
 
+discord.useNews(news);
 await news.start(discord, store.guildRef?.('newsChannelId')).then((ch) => store.setGuildRef?.('newsChannelId', ch.id));
 
 await http.listen();

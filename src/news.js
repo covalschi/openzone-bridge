@@ -113,6 +113,20 @@ export class News {
     }
   }
 
+  // The single writing door: a forum post authored by `who`. Everything else
+  // about the feed is read-only, and the channel permissions agree.
+  async post(who, title, body) {
+    const ch = await this.discord.client.channels.fetch(this.channelId);
+    const hook = await this.discord.webhookFor(ch);
+    if (!hook) throw new Error('no webhook on the news forum');
+
+    await hook.send({
+      threadName: title.slice(0, 90),
+      username: who.slice(0, 80),
+      content: byteClip(body),
+    });
+  }
+
   async #onThread(th, warm = false) {
     if (th.parentId !== this.channelId) return;
 

@@ -225,16 +225,152 @@ export class DiscordSide {
                 },
               ],
             },
+            {
+              name: 'persona',
+              description: 'NPC posters for the news feed',
+              type: 2, // SUB_COMMAND_GROUP
+              options: [
+                {
+                  name: 'create',
+                  description: 'Mint a new poster persona',
+                  type: 1,
+                  options: [{ name: 'name', description: 'The name posts will carry', type: 3, required: true }],
+                },
+                {
+                  name: 'grant',
+                  description: 'Let a faction post as this persona',
+                  type: 1,
+                  options: [
+                    { name: 'name', description: 'The persona', type: 3, required: true },
+                    { name: 'faction', description: 'Faction slug, e.g. duty', type: 3, required: true },
+                  ],
+                },
+                {
+                  name: 'revoke',
+                  description: 'Take the persona away from a faction',
+                  type: 1,
+                  options: [
+                    { name: 'name', description: 'The persona', type: 3, required: true },
+                    { name: 'faction', description: 'Faction slug, e.g. duty', type: 3, required: true },
+                  ],
+                },
+                {
+                  name: 'list',
+                  description: 'Show every persona and who holds it',
+                  type: 1,
+                },
+              ],
+            },
+          ],
+        },
+        {
+          name: 'post',
+          description: 'Post to the Zone news feed',
+          options: [
+            { name: 'title', description: 'The headline', type: 3, required: true },
+            { name: 'body', description: 'The text of the post', type: 3, required: true },
+            {
+              name: 'as',
+              description: 'Post as a persona (leaders and admins only)',
+              type: 3,
+              required: false,
+            },
           ],
         },
       ]);
-      console.log('[discord] /link and /openzone registered on the guild');
+      console.log('[discord] /link, /openzone and /post registered on the guild');
     } catch (e) {
       console.warn(
         `[discord] could not register slash commands (${e.message}). ` +
           'The invite probably lacks the applications.commands scope. ' +
           'Chat still works; /link will not.',
       );
+    }
+  }
+
+  // /openzone persona ... -- the admin surface of the NPC posters.
+  async #persona(i, sub) {
+    if (!this.personas) {
+      await i.reply({ content: 'Personas are not available right now.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    if (sub === 'create') {
+      const name = i.options.getString('name').trim().slice(0, 60);
+      const r = this.personas.create(name, i.user.id);
+      await i.reply({
+        content: r.Error ? `"${name}" already exists.` : `Persona **${name}** minted. Grant it with /openzone persona grant.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === 'grant' || sub === 'revoke') {
+      const name = i.options.getString('name').trim();
+      const slug = i.options.getString('faction').trim();
+      if (this.roles && !this.roles.find(slug)) {
+        await i.reply({ content: `No faction with slug "${slug}".`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      const r = sub === 'grant' ? this.personas.grant(name, slug) : this.personas.revoke(name, slug);
+      await i.reply({
+        content: r.Error ? `No persona "${name}".` : `Done: **${name}** ${sub === 'grant' ? 'granted to' : 'revoked from'} ${slug}.`,
+        flags: MessageFlags.Ephemeral,
+      });
+      return;
+    }
+
+    if (sub === 'list') {
+      const items = this.personas.list();
+      const lines = items.map((p) => `**${p.name}** — ${p.factions.join(', ') || 'nobody'}`);
+      await i.reply({ content: lines.join('\n') || 'No personas yet.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    await i.reply({ content: 'Unknown persona command.', flags: MessageFlags.Ephemeral });
+  }
+
+  // /post -- the only door into the news forum. Ordinary players speak as
+  // their linked character; leaders and admins may wear a granted persona.
+  async #post(i) {
+    if (!this.news) {
+      await i.reply({ content: 'The news feed is not available right now.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    const uid = this.store.steamIdOf(i.user.id);
+    const selfName = (uid && this.store.nameOf(uid)) || '';
+    const admin = this.isAdminMember(i.member);
+
+    if (!selfName && !admin) {
+      await i.reply({ content: 'Link your account first: /link with the code from your PDA.', flags: MessageFlags.Ephemeral });
+      return;
+    }
+
+    let who = selfName || i.member?.displayName || i.user.username;
+
+    const as = (i.options.getString('as') || '').trim();
+    if (as) {
+      const resolved = this.roles && i.member ? this.roles.resolve(i.member) : null;
+      const allowed = this.personas ? this.personas.allowedFor(resolved, admin) : [];
+      if (!allowed.includes(as)) {
+        const hint = allowed.length ? `You may post as: ${allowed.join(', ')}.` : 'You have no personas.';
+        await i.reply({ content: `Not your voice. ${hint}`, flags: MessageFlags.Ephemeral });
+        return;
+      }
+      who = as;
+    }
+
+    const title = i.options.getString('title').trim().slice(0, 90);
+    const body = i.options.getString('body');
+
+    await i.deferReply({ flags: MessageFlags.Ephemeral });
+    try {
+      await this.news.post(who, title, body);
+      await i.editReply({ content: `Posted as **${who}**.` });
+    } catch (err) {
+      console.warn(`[news] post failed: ${err.message}`);
+      await i.editReply({ content: 'The post did not go through. Try again.' });
     }
   }
 
@@ -443,6 +579,23 @@ export class DiscordSide {
     this.roles = roles;
   }
 
+  usePersonas(personas) {
+    this.personas = personas;
+  }
+
+  useNews(news) {
+    this.news = news;
+  }
+
+  // Admin is a PERMISSION or a ROLE: guilds that run on a dedicated admin
+  // role set DISCORD_ADMIN_ROLE_ID, everyone else falls back to the Discord
+  // Administrator bit.
+  isAdminMember(member) {
+    if (!member) return false;
+    if (this.cfg.adminRoleId && member.roles?.cache?.has(this.cfg.adminRoleId)) return true;
+    return !!member.permissions?.has(PermissionFlagsBits.Administrator);
+  }
+
   async #interaction(i) {
     if (!i.isChatInputCommand()) return;
 
@@ -450,6 +603,11 @@ export class DiscordSide {
 
     if (i.commandName === 'openzone') {
       await this.#openzone(i);
+      return;
+    }
+
+    if (i.commandName === 'post') {
+      await this.#post(i);
       return;
     }
 
@@ -519,7 +677,7 @@ export class DiscordSide {
   // it in Server Settings -- so the permission is checked again here rather
   // than trusted.
   async #openzone(i) {
-    if (!i.memberPermissions || !i.memberPermissions.has(PermissionFlagsBits.Administrator)) {
+    if (!this.isAdminMember(i.member)) {
       await i.reply({ content: 'That is for server administrators.', flags: MessageFlags.Ephemeral });
       return;
     }
@@ -530,6 +688,11 @@ export class DiscordSide {
 
     const group = i.options.getSubcommandGroup(false);
     const sub = i.options.getSubcommand(false);
+
+    if (group === 'persona') {
+      await this.#persona(i, sub);
+      return;
+    }
 
     if (group === 'roles' && sub === 'sync') {
       // Creating a dozen roles takes longer than the three seconds Discord
@@ -702,7 +865,7 @@ export class DiscordSide {
 
     this.onMessage(convo.key, {
       id: m.id,
-      at: new Date(m.createdTimestamp).toISOString(),
+      at: new Date(m.createdTimestamp).toISOString().slice(0, 19).replace('T', ' '),
       uid,
       who,
       text,
@@ -984,6 +1147,44 @@ export class DiscordSide {
     return await th.send({ content, allowedMentions: { parse: [] } });
   }
 
+  // A page of thread history BEFORE the given message id (or the newest
+  // page when no anchor). Returned oldest-first, each line already shaped
+  // for the game: webhook posts wear the speaker's name as the author, our
+  // bot fallback posts carry it bolded in the text and are unwrapped here.
+  async fetchOlder(threadId, beforeId, limit) {
+    const th = await this.client.channels.fetch(threadId);
+    const opts = { limit: Math.min(limit || 50, 100) };
+    if (beforeId) opts.before = beforeId;
+
+    const batch = await th.messages.fetch(opts);
+    const out = [];
+    for (const m of batch.values()) {
+      let who = m.member?.displayName || m.author?.username || '';
+      let text = m.content || '';
+      if (!m.webhookId && m.author?.id === this.client.user.id) {
+        const cut = text.match(/^\*\*(.{1,80}?)\*\*: ([\s\S]*)$/);
+        if (cut) {
+          who = cut[1];
+          text = cut[2];
+        }
+      }
+      out.push({
+        id: m.id,
+        at: new Date(m.createdTimestamp).toISOString().slice(0, 19).replace('T', ' '),
+        who,
+        text: byteClip(text),
+      });
+    }
+
+    out.sort((a, b) => (a.id < b.id ? -1 : 1));
+    return out;
+  }
+
+  async renameThread(threadId, name) {
+    const th = await this.client.channels.fetch(threadId);
+    await th.setName(name.slice(0, 100));
+  }
+
   async deleteNoteMessage(threadId, messageId) {
     if (this.notesWebhook) {
       try {
@@ -1006,6 +1207,12 @@ export class DiscordSide {
       if (err?.code === 10008 || err?.code === 10003) return;
       throw err;
     }
+  }
+
+  // The news module speaks through a webhook too -- that is what puts the
+  // persona's NAME on the post instead of the bot's.
+  async webhookFor(channel) {
+    return this.#webhookOn(channel);
   }
 
   // The channel-bound twin of #ensureWebhook.
