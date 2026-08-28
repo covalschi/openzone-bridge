@@ -991,8 +991,18 @@ export class DiscordSide {
         // from before notebooks moved) -- delete as the bot.
       }
     }
-    const th = await this.client.channels.fetch(threadId);
-    await th.messages.delete(messageId);
+    try {
+      const th = await this.client.channels.fetch(threadId);
+      await th.messages.delete(messageId);
+    } catch (err) {
+      // 10008 Unknown Message / 10003 Unknown Channel: the whole point of
+      // this call is "that message must not exist" -- it already does not.
+      // A stale MsgId (someone deleted the message by hand while the bridge
+      // slept, so the gateway prune never saw it) otherwise bricks the note
+      // forever: every resave starts with this delete and dies right here.
+      if (err?.code === 10008 || err?.code === 10003) return;
+      throw err;
+    }
   }
 
   // The channel-bound twin of #ensureWebhook.

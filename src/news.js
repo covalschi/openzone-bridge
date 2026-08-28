@@ -123,7 +123,9 @@ export class News {
     post.Title = th.name;
     post.ts = th.createdTimestamp || post.ts;
     post.At = stamp(post.ts);
-    post.Replies = Math.max(0, (th.messageCount || 1) - 1);
+    // Discord's message_count already excludes the starter message, so it
+    // IS the reply count -- subtracting one here ate a reply per post.
+    post.Replies = Math.max(0, th.messageCount || 0);
 
     if (!known || warm || !post.Body) {
       try {

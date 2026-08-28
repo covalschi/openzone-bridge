@@ -58,11 +58,30 @@ export class Store {
   }
 
   save() {
+    if (this.saveTimer) {
+      clearTimeout(this.saveTimer);
+      this.saveTimer = null;
+    }
     mkdirSync(dirname(this.path), { recursive: true });
     // Write beside, then rename: a half-written index is worse than an old one.
     const tmp = `${this.path}.tmp`;
     writeFileSync(tmp, JSON.stringify(this.data, null, 2));
     renameSync(tmp, this.path);
+  }
+
+  // For the message tail ONLY. The tail is a cache -- Discord holds the
+  // truth, and a lost second of it merely un-caches a line the next poll
+  // re-reads. Structural changes (links, convos, guild refs) stay on the
+  // synchronous save(): losing those makes threads unreachable. Without
+  // this split every gateway message rewrote the whole file synchronously,
+  // blocking the event loop once per line of chat.
+  saveSoon() {
+    if (this.saveTimer) return;
+    this.saveTimer = setTimeout(() => {
+      this.saveTimer = null;
+      this.save();
+    }, 1000);
+    this.saveTimer.unref?.();
   }
 
   // ---- guild furniture ----
@@ -163,7 +182,7 @@ export class Store {
     const stored = { ...msg, cursor: this.data.cursor };
     list.push(stored);
     while (list.length > this.keep) list.shift();
-    this.save();
+    this.saveSoon();
     return stored;
   }
 
