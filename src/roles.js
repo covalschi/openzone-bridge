@@ -30,6 +30,7 @@ const C = {
   freedom: 0x60b048,
   mercenary: 0x5082be,
   neutral: 0xc8c8c8,
+  stalker: 0xd8c070,
   bandit: 0x967846,
   clearsky: 0x78bec8,
   monolith: 0xaa96dc,
@@ -44,6 +45,12 @@ export const DEFAULTS = {
   // Ordered low to high. Order is EXPLICIT and lives here -- never Discord's
   // role position, which guild admins drag around in the UI for display and
   // would silently reorder the ranks.
+  //
+  // These are STALKER ranks: personal standing in the Zone, a separate axis
+  // from faction (owner's decision 2026-08-30). Joining Duty does not erase
+  // being a legend -- the rank stays through every faction change, like the
+  // base stalker identity itself. Faction-scoped ranks are a different,
+  // future thing and will live inside their faction's entry.
   Ranks: [
     { Slug: 'stalker-novice', Label: 'Сталкер-новачок', Order: 1, Color: C.rank },
     { Slug: 'stalker-experienced', Label: 'Досвідчений сталкер', Order: 2, Color: C.rank },
@@ -70,6 +77,15 @@ export const DEFAULTS = {
       Posts: [{ Slug: 'leader', Label: 'Лідер найманців' }] },
     { Slug: 'neutral', Label: 'Нейтрали', Color: C.neutral,
       Posts: [{ Slug: 'leader', Label: 'Лідер нейтралів' }] },
+    // THE BASE IDENTITY, not one faction among many (owner's decision
+    // 2026-08-30). Everyone in the Zone is a stalker: the role goes on at
+    // link time, STAYS ON through every faction change, and joining Duty
+    // means being a stalker IN Duty, not instead of it. It has no leader
+    // (a crowd, not an organisation) and cannot be deleted. The FLAG is what
+    // the code reads, never the slug: a guild is free to name its base
+    // something else, and the game closes its faction screen for whichever
+    // faction carries it.
+    { Slug: 'stalker', Label: 'Сталкери', Color: C.stalker, Posts: [], Base: true },
     { Slug: 'bandit', Label: 'Бандити', Color: C.bandit,
       Posts: [{ Slug: 'leader', Label: 'Лідер бандитів' }] },
     { Slug: 'clearsky', Label: 'Чисте небо', Color: C.clearsky,
@@ -154,7 +170,29 @@ export class Roles {
       // The faction is already here, but a post inside it may not be.
       had.Posts ||= [];
       for (const p of f.Posts || []) add(had.Posts, p, f.Slug + ':' + p.Slug);
+
+      // Base is STRUCTURE, not decoration: it says this faction is what
+      // everyone in the Zone is, and the code special-cases it in half a
+      // dozen places. Label and Color stay the admin's -- this one flag
+      // follows the defaults, or a guild that predates it would keep a
+      // stalker faction the game treats as an organisation.
+      if (f.Base && !had.Base) {
+        had.Base = true;
+        this.grew.push(f.Slug + ':base');
+      }
     }
+  }
+
+  // THE BASE FACTION: the one everybody in the Zone wears. Asked by slug
+  // nowhere -- the flag is the fact, and a guild is free to name its own
+  // base something other than "stalker" without any code caring.
+  base() {
+    return this.data.Factions.find((f) => f.Base) || null;
+  }
+
+  isBase(slug) {
+    const f = this.data.Factions.find((x) => x.Slug === slug);
+    return !!(f && f.Base);
   }
 
   // Changes whenever the roster does, so the game can be told once
@@ -180,6 +218,12 @@ export class Roles {
       yield { kind: 'faction', slug: f.Slug, label: f.Label, color: f.Color, node: f };
       for (const p of f.Posts || []) {
         yield { kind: 'post', slug: f.Slug + ':' + p.Slug, label: p.Label, color: f.Color, node: p, faction: f.Slug };
+      }
+      // Faction-scoped ranks: a FOURTH axis, separate from the global
+      // stalker ranks on purpose (owner's decision 2026-08-30). Ordered,
+      // one per member, and they die with faction membership.
+      for (const q of f.Ranks || []) {
+        yield { kind: 'facrank', slug: f.Slug + ':' + q.Slug, label: q.Label, color: f.Color, node: q, faction: f.Slug };
       }
     }
     for (const t of this.data.Traits) yield { kind: 'trait', slug: t.Slug, label: t.Label, color: t.Color, node: t };
@@ -344,13 +388,132 @@ export class Roles {
   //
   // Every piece carries the same Stamp -- it is one roster, and the game
   // tracks having seen that stamp, not having seen N items.
+  // A new faction, born HERE: the bot owns Discord roles, so the entry is
+  // appended to the registry and sync() then creates the roles. The game
+  // config follows separately on the game server.
+  async addFaction(guild, slug, label, color, hasLeader) {
+    if (!/^[a-z][a-z0-9_-]{1,23}$/.test(slug)) {
+      return { ok: false, why: 'slug must be a short lowercase word' };
+    }
+    if (this.data.Factions.some((f) => f.Slug === slug)) {
+      return { ok: false, why: 'this faction already exists' };
+    }
+
+    const node = {
+      Slug: slug,
+      Label: label || slug,
+      Color: color || 0xc8c8c8,
+      Posts: hasLeader ? [{ Slug: 'leader', Label: 'Лідер: ' + (label || slug) }] : [],
+    };
+    this.data.Factions.push(node);
+    this.save();
+
+    await guild.roles.fetch();
+    const r = await this.sync(guild);
+    if (r.failed.length) return { ok: false, why: 'Discord refused to create the role' };
+    return { ok: true };
+  }
+
+  // A faction-scoped rank, born from the bot like everything else. Order is
+  // explicit and higher outranks lower -- succession reads it. The slug
+  // shares the faction's namespace with posts, and 'leader' is reserved.
+  async addFactionRank(guild, facSlug, slug, label, order) {
+    const f = this.data.Factions.find((x) => x.Slug === facSlug);
+    if (!f) return { ok: false, why: `no such faction: ${facSlug}` };
+
+    // Stalkers rank by the GLOBAL stalker ranks -- that axis already
+    // exists, and a second ladder inside the base identity would be the
+    // same fact in two homes.
+    if (f.Base) return { ok: false, why: 'the base faction uses the stalker ranks, not faction ranks' };
+
+    if (!/^[a-z][a-z0-9_-]{1,23}$/.test(slug)) {
+      return { ok: false, why: 'slug must be a short lowercase word' };
+    }
+
+    f.Ranks ||= [];
+    const taken = slug === 'leader'
+      || (f.Posts || []).some((p) => p.Slug === slug)
+      || f.Ranks.some((r) => r.Slug === slug);
+    if (taken) return { ok: false, why: 'that slug is already taken inside this faction' };
+
+    const n = Math.floor(Number(order));
+    if (!(n > 0)) return { ok: false, why: 'order must be a positive number - higher outranks lower' };
+
+    f.Ranks.push({ Slug: slug, Label: label || slug, Order: n });
+    f.Ranks.sort((a, b) => a.Order - b.Order);
+    this.save();
+
+    await guild.roles.fetch();
+    const r = await this.sync(guild);
+    if (r.failed.length) return { ok: false, why: 'Discord refused to create the role' };
+    return { ok: true };
+  }
+
+  async delFactionRank(guild, facSlug, slug) {
+    const f = this.data.Factions.find((x) => x.Slug === facSlug);
+    if (!f) return { ok: false, why: `no such faction: ${facSlug}` };
+
+    const at = (f.Ranks || []).findIndex((r) => r.Slug === slug);
+    if (at === -1) return { ok: false, why: 'no such rank in that faction' };
+
+    const node = f.Ranks[at];
+    if (node.RoleId) {
+      try {
+        await guild.roles.delete(node.RoleId, 'OpenZone: faction rank removed');
+      } catch {
+        // Already gone, or not ours to delete -- the registry entry goes
+        // either way; a stray role is visible and fixable by hand.
+      }
+    }
+
+    f.Ranks.splice(at, 1);
+    this.save();
+    return { ok: true };
+  }
+
+  // Deletion takes the Discord roles with it: a faction the admin removed
+  // must not keep marking members. Members lose the role by role deletion.
+  async delFaction(guild, slug) {
+    // The base identity is not removable: deleting it would strip "being a
+    // stalker" off every member at once, and nothing in the model survives
+    // that.
+    if (this.isBase(slug)) return { ok: false, why: 'that is the base identity, it cannot be removed' };
+
+    const at = this.data.Factions.findIndex((f) => f.Slug === slug);
+    if (at === -1) return { ok: false, why: 'no such faction' };
+
+    const node = this.data.Factions[at];
+    const ids = [
+      node.RoleId,
+      ...(node.Posts || []).map((p) => p.RoleId),
+      ...(node.Ranks || []).map((r) => r.RoleId),
+    ].filter(Boolean);
+    for (const id of ids) {
+      try {
+        await guild.roles.delete(id, 'OpenZone: faction removed');
+      } catch {
+        // Already gone, or not ours to delete -- the registry entry goes
+        // either way; a stray role is visible and fixable by hand.
+      }
+    }
+
+    this.data.Factions.splice(at, 1);
+    this.save();
+    return { ok: true };
+  }
+
   rosterParts() {
     const stamp = this.stamp();
 
+    // Base travels because the GAME has to know which faction is merely
+    // everyone's identity: it is the bot that puts that badge on every
+    // linked member, so it is the bot that knows. The PDA closes its
+    // faction screen for a base faction -- there is no roster to show.
     const factions = this.data.Factions.map((f) => ({
       Id: f.Slug,
       DisplayName: f.Label,
       Color: hexToRgb(f.Color),
+      Base: !!f.Base,
     }));
 
     // Ranks, traits and posts travel for the SAME reason factions do: the bot
@@ -363,6 +526,12 @@ export class Roles {
     const posts  = this.data.Factions.flatMap((f) =>
       (f.Posts || []).map((p) => ({ Id: f.Slug + ':' + p.Slug, DisplayName: p.Label })),
     );
+    // Faction ranks travel as their own list, not inside Posts: the game
+    // keeps a catalog per axis for the admin UI, and mixing the two would
+    // put sergeants in the posts picker.
+    const franks = this.data.Factions.flatMap((f) =>
+      (f.Ranks || []).map((q) => ({ Id: f.Slug + ':' + q.Slug, DisplayName: q.Label })),
+    );
 
     const parts = [];
     let cur = null;
@@ -373,7 +542,7 @@ export class Roles {
 
     const flush = () => {
       if (cur) parts.push(cur);
-      cur = { Stamp: stamp, Factions: [], Ranks: [], Traits: [], Posts: [] };
+      cur = { Stamp: stamp, Factions: [], Ranks: [], Traits: [], Posts: [], FRanks: [] };
     };
     flush();
 
@@ -392,11 +561,12 @@ export class Roles {
     for (const r of ranks)    put('Ranks', r);
     for (const t of traits)   put('Traits', t);
     for (const p of posts)    put('Posts', p);
+    for (const q of franks)   put('FRanks', q);
 
     if (cur) parts.push(cur);
 
     return parts.filter(
-      (x) => x.Factions.length || x.Ranks.length || x.Traits.length || x.Posts.length,
+      (x) => x.Factions.length || x.Ranks.length || x.Traits.length || x.Posts.length || x.FRanks.length,
     );
   }
 
@@ -527,9 +697,14 @@ export class Roles {
     if (cut !== -1) {
       const f = this.data.Factions.find((x) => x.Slug === slug.slice(0, cut));
       if (!f) return null;
-      const p = (f.Posts || []).find((x) => x.Slug === slug.slice(cut + 1));
-      if (!p) return null;
-      return { kind: 'post', node: p, faction: f };
+      const sub = slug.slice(cut + 1);
+      // Posts and faction ranks share the faction's namespace -- creation
+      // refuses a duplicate slug, so at most one of these matches.
+      const p = (f.Posts || []).find((x) => x.Slug === sub);
+      if (p) return { kind: 'post', node: p, faction: f };
+      const q = (f.Ranks || []).find((x) => x.Slug === sub);
+      if (q) return { kind: 'facrank', node: q, faction: f };
+      return null;
     }
 
     const r = this.data.Ranks.find((x) => x.Slug === slug);
@@ -562,16 +737,36 @@ export class Roles {
     const held = (member, id) => id && member.roles.cache.has(id);
 
     // Which faction the member is actually in, by the same rule resolve()
-    // uses -- one held role, or nothing.
+    // uses: the one REAL (non-stalker) faction, or the stalker base when
+    // there is no real one, or nothing when two real ones collide.
     const factionOf = (member) => {
-      const has = this.data.Factions.filter((f) => held(member, f.RoleId));
-      return has.length === 1 ? has[0] : null;
+      const real = this.data.Factions.filter((f) => !f.Base && held(member, f.RoleId));
+      if (real.length === 1) return real[0];
+      if (real.length > 1) return null;
+      return this.data.Factions.find((f) => f.Base && held(member, f.RoleId)) || null;
     };
 
     const add = [];
     const remove = [];
 
+    // Every real faction the target is leaving -- leadership there may need
+    // to pass on once the roles have actually changed. A LIST, not one slug:
+    // a member healing out of the two-faction corruption leaves both, and
+    // factionOf() refuses to name either.
+    const wasSlugs = [];
+
     if (op === 'faction.set' || op === 'faction.clear') {
+      // FRESH member, not the cache. Two quick sets in a row read a stale
+      // roles.cache, held() missed the just-added faction, the removal was
+      // skipped -- and the member ended up wearing TWO faction roles, which
+      // resolve() rightly refuses to project (measured 2026-08-30:
+      // freedom + ecolog on one member, empty faction in the game).
+      try {
+        target = await guild.members.fetch({ user: target.id, force: true });
+      } catch {
+        return { ok: false, why: 'cannot fetch the member from Discord' };
+      }
+
       const was = factionOf(target);
 
       // ALREADY THERE -- change nothing, and say yes.
@@ -593,12 +788,33 @@ export class Roles {
       // Leaving a faction takes its posts with it. A "Лідер Долга" badge on
       // somebody who is no longer in Duty is exactly the stale state the
       // resolve() rules already refuse to honour -- so do not create it.
-      if (was) {
-        remove.push(was.RoleId);
-        for (const p of was.Posts || []) if (held(target, p.RoleId)) remove.push(p.RoleId);
+      //
+      // EVERY real faction role held comes off, not merely factionOf's
+      // answer: factionOf refuses to pick when a past race left two badges
+      // on one member, and the set is the natural moment that corruption
+      // heals. The stalker BASE never comes off -- one faction at a time
+      // means one REAL faction; being a stalker is not a membership, it is
+      // what everyone in the Zone is.
+      for (const f of this.data.Factions) {
+        if (f.Base) continue;
+        if (!held(target, f.RoleId)) continue;
+        wasSlugs.push(f.Slug);
+        remove.push(f.RoleId);
+        for (const p of f.Posts || []) if (held(target, p.RoleId)) remove.push(p.RoleId);
+        // Faction ranks die with membership, exactly like posts: a Duty
+        // sergeant badge on somebody who left Duty means nothing.
+        for (const q of f.Ranks || []) if (held(target, q.RoleId)) remove.push(q.RoleId);
       }
 
-      if (op === 'faction.set') {
+      // The base goes ON whenever it is somehow missing: set, clear, any
+      // faction move re-asserts it. Cheap, and it self-heals members who
+      // predate this rule.
+      const base = this.base();
+      if (base && base.RoleId && !base.Missing && !held(target, base.RoleId)) add.push(base.RoleId);
+
+      // "Move him to the stalkers" is the same act as clearing: the base is
+      // already everyone's, so there is nothing more to add.
+      if (op === 'faction.set' && !this.isBase(arg)) {
         const e = this.find(arg);
         if (!e || e.kind !== 'faction') return { ok: false, why: `no such faction: ${arg}` };
         const id = idOf(e);
@@ -634,6 +850,52 @@ export class Roles {
       const id = idOf(e);
       if (!id) return { ok: false, why: `the Discord role for ${arg} is missing` };
       (op === 'trait.add' ? add : remove).push(id);
+    } else if (op === 'frank.set') {
+      // The FACTION rank: one per member, scoped to the faction actually
+      // held, a separate axis from the global stalker rank. The arg is the
+      // BARE slug -- which ladder applies is decided by the target's own
+      // faction, so a Duty leader cannot even name Freedom's ranks.
+      const now = factionOf(target);
+      if (!now || now.Base) return { ok: false, why: 'that player is not in a faction' };
+
+      for (const q of now.Ranks || []) if (held(target, q.RoleId)) remove.push(q.RoleId);
+
+      if (arg) {
+        const rk = (now.Ranks || []).find((x) => x.Slug === arg);
+        if (!rk) return { ok: false, why: `no such rank in ${now.Label}: ${arg}` };
+        const id = rk.Missing ? null : rk.RoleId;
+        if (!id) return { ok: false, why: `the Discord role for ${now.Slug}:${arg} is missing` };
+        add.push(id);
+      }
+    } else if (op === 'leader.set') {
+      // The ADMIN names the leader outright. Different from leader.transfer
+      // on purpose: transfer is the leader's own act and requires him to
+      // hold the post; set is the console's act and requires nothing but a
+      // target inside a faction. leaderMay() never allows it, so only the
+      // admin path reaches here.
+      const now = factionOf(target);
+      if (!now || now.Base) return { ok: false, why: 'that player is not in a faction' };
+
+      const post = (now.Posts || []).find((p) => p.Slug === 'leader');
+      const id = post && !post.Missing ? post.RoleId : null;
+      if (!id) return { ok: false, why: `${now.Label} has no leader role` };
+
+      // Set, singular: the post comes OFF everyone else first, or the guild
+      // ends up with two leaders and the contested rule blanks them both.
+      const role = guild.roles.cache.get(id);
+      if (role) {
+        for (const m of role.members.values()) {
+          if (m.id === target.id) continue;
+          try {
+            await m.roles.remove(id, 'OpenZone: the leader was set by an admin');
+          } catch {
+            // The one we could not strip stays visible in Discord; the
+            // contested rule keeps the post honest until somebody fixes it.
+          }
+        }
+      }
+
+      add.push(id);
     } else if (op === 'rank.set') {
       // One rank at a time: every other one comes off, by the same rule
       // resolve() reads them with.
@@ -676,19 +938,124 @@ export class Roles {
       return { ok: false, why: `unknown operation: ${op}` };
     }
 
+    // ONE atomic PATCH with the final role set -- never remove-then-add.
+    // GuildMemberRoleManager's array add() and remove() each rebuild the
+    // FULL list from the member's role cache, and the second call reads
+    // that cache as it was before the first one landed. Measured
+    // 2026-08-30: a move from freedom to military stripped freedom and
+    // its leader post, then the add() put them straight back, and the
+    // member stood in two factions with two posts while the game
+    // projected the conflict as "no faction at all".
+    let movedRoles = null;
     try {
-      // Remove first. Setting a faction removes the old one, and doing that
-      // second on a member who briefly holds two makes resolve() answer
-      // "conflict" to anybody polling in between.
-      const drop = remove.filter((id) => id && held(target, id));
-      if (drop.length) await target.roles.remove(drop, 'OpenZone');
+      const gainList = add.filter(Boolean);
+      const dropSet = new Set(remove.filter(Boolean).filter((id) => !gainList.includes(id)));
 
-      const gain = add.filter((id) => id && !held(target, id));
-      if (gain.length) await target.roles.add(gain, 'OpenZone');
+      const current = [...target.roles.cache.keys()];
+      const final = current.filter((id) => !dropSet.has(id));
+      for (const id of gainList) if (!final.includes(id)) final.push(id);
+      movedRoles = new Set(final);
 
-      return { ok: true };
+      const changed = final.length !== current.length || final.some((id) => !current.includes(id));
+      if (changed) await target.roles.set(final, 'OpenZone');
     } catch (e) {
       return { ok: false, why: this.#whyDiscordSaidNo(e) };
+    }
+
+    // Leadership follows membership. AFTER the role change, or the pool
+    // still contains yesterday: the faction he joined may have been empty
+    // (its first member leads), the ones he left may have just lost their
+    // leader (the post passes down). The mover's FINAL roles travel along:
+    // every cache -- ours and the gateway's -- lags the PATCH we just made,
+    // and reading it back is how the first member failed to get his post
+    // (measured 2026-08-30).
+    if (op === 'faction.set' || op === 'faction.clear') {
+      const moved = { id: target.id, roleIds: movedRoles };
+      const joined = op === 'faction.set' && !this.isBase(arg) ? arg : '';
+      if (joined) await this.ensureLeadership(guild, joined, 'the first member leads', moved);
+      for (const ws of wasSlugs) {
+        if (ws !== joined) await this.ensureLeadership(guild, ws, 'the leader left', moved);
+      }
+    }
+
+    return { ok: true };
+  }
+
+  // Leadership follows membership on its own (owner's decision 2026-08-30):
+  // the first member of a faction leads it, and when the leader leaves the
+  // post passes down -- by the faction's own rank first, by stalker rank
+  // next, and to the first member found when everything ties. The stalker
+  // base is exempt: a crowd has no leader.
+  //
+  // Does nothing when a valid leader is already there, so it is safe to call
+  // after every membership change.
+  //
+  // `moved` is the member whose roles the caller JUST rewrote, with the
+  // authoritative final set: every cache -- ours and the gateway's -- lags
+  // the PATCH for a moment, and reading it back is how the first member of
+  // a faction failed to receive his post (measured 2026-08-30). His roles
+  // come from the caller's own hands; everyone else's from the cache, which
+  // is honest about members this operation did not touch.
+  async ensureLeadership(guild, slug, reason, moved = null) {
+    if (!slug || this.isBase(slug)) return;
+
+    const f = this.data.Factions.find((x) => x.Slug === slug);
+    if (!f || !f.RoleId) return;
+
+    const post = (f.Posts || []).find((p) => p.Slug === 'leader');
+    const id = post && !post.Missing ? post.RoleId : null;
+    if (!id) return;
+
+    const holdsRole = (m, roleId) => {
+      if (moved && moved.roleIds && m.id === moved.id) return moved.roleIds.has(roleId);
+      return m.roles.cache.has(roleId);
+    };
+
+    let members;
+    try {
+      members = await guild.members.fetch();
+    } catch {
+      members = guild.members.cache;
+    }
+
+    // Only linked members count -- the same rule as the contested-leader
+    // check, for the same reason: a role on an account the game will never
+    // ask about is a label, not a person in the Zone, and it must neither
+    // hold authority nor inherit it.
+    const linked = (m) => !this.isLinked || this.isLinked(m.id);
+
+    const holders = members.filter((m) => holdsRole(m, id) && holdsRole(m, f.RoleId) && linked(m));
+    if (holders.size >= 1) return;
+
+    const pool = [...members.filter((m) => holdsRole(m, f.RoleId) && linked(m)).values()];
+    if (!pool.length) return;
+
+    // The faction's own rank decides first, the stalker rank breaks the
+    // tie, and a full tie goes to the first in the list (owner's order).
+    const frankOrd = (m) => {
+      let best = 0;
+      for (const q of f.Ranks || []) {
+        if (q.RoleId && holdsRole(m, q.RoleId) && q.Order > best) best = q.Order;
+      }
+      return best;
+    };
+    const rankOrd = (m) => {
+      let best = 0;
+      for (const r of this.data.Ranks) {
+        if (r.RoleId && holdsRole(m, r.RoleId) && r.Order > best) best = r.Order;
+      }
+      return best;
+    };
+
+    pool.sort((a, b) => (frankOrd(b) - frankOrd(a)) || (rankOrd(b) - rankOrd(a)));
+    const heir = pool[0];
+
+    try {
+      // A single-role add is a direct PUT: no cache in the way.
+      await heir.roles.add(id, 'OpenZone: leadership - ' + reason);
+      console.log(`[roles] ${f.Label}: ${heir.user?.tag || heir.id} now leads (${reason})`);
+    } catch (e) {
+      console.warn(`[roles] ${f.Label}: cannot hand leadership over: ${e.message}`);
     }
   }
 
@@ -722,11 +1089,18 @@ export class Roles {
     // FACTION: refuse to guess. Faction feeds hostility, and showing no
     // faction is the safe answer AND makes the misconfiguration visible on
     // the player's own card, so somebody fixes it.
+    //
+    // THE BASE IS NOT A CONFLICT. Everyone wears the stalker role, so
+    // "stalker + duty" is the normal state of every Duty member, and the
+    // REAL faction is the non-stalker one. Only two real factions at once
+    // is the corruption this rule refuses to project.
     const held = this.data.Factions.filter((f) => has(f.RoleId));
+    const real = held.filter((f) => !f.Base);
     let faction = '';
     let conflict = [];
-    if (held.length === 1) faction = held[0].Slug;
-    if (held.length > 1) conflict = held.map((f) => f.Slug);
+    if (real.length === 1) faction = real[0].Slug;
+    if (real.length === 0 && held.length > 0) faction = held[0].Slug;
+    if (real.length > 1) conflict = real.map((f) => f.Slug);
 
     // Posts only count inside the faction actually held. A Duty leader badge
     // on somebody who is not in Duty means nothing.
@@ -754,7 +1128,21 @@ export class Roles {
 
     const traits = this.data.Traits.filter((t) => has(t.RoleId)).map((t) => t.Slug);
 
-    return { Faction: faction, Conflict: conflict, Posts: posts, Rank: rank, Traits: traits };
+    // FACTION RANK: highest wins, same rule as the stalker rank -- and only
+    // inside the faction actually held, same rule as the posts.
+    let frank = '';
+    if (faction && !this.isBase(faction)) {
+      const ff = this.data.Factions.find((x) => x.Slug === faction);
+      let fbest = -1;
+      for (const q of ff.Ranks || []) {
+        if (!has(q.RoleId)) continue;
+        if (q.Order <= fbest) continue;
+        fbest = q.Order;
+        frank = q.Slug;
+      }
+    }
+
+    return { Faction: faction, Conflict: conflict, Posts: posts, Rank: rank, FRank: frank, Traits: traits };
   }
 }
 

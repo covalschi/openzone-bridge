@@ -203,6 +203,59 @@ export class DiscordSide {
               ],
             },
             {
+              name: 'faction',
+              description: 'Faction lifecycle - the bot owns it',
+              type: 2, // SUB_COMMAND_GROUP
+              options: [
+                {
+                  name: 'add',
+                  description: 'Create a faction: Discord roles now, the game learns it within seconds',
+                  type: 1, // SUB_COMMAND
+                  options: [
+                    { name: 'slug', description: 'Short lowercase id, e.g. renegade', type: 3, required: true },
+                    { name: 'name', description: 'Display name players see', type: 3, required: true },
+                    { name: 'leader', description: 'Does it have a leader post?', type: 5, required: false },
+                  ],
+                },
+                {
+                  name: 'remove',
+                  description: 'Delete a faction and its Discord roles',
+                  type: 1, // SUB_COMMAND
+                  options: [
+                    { name: 'slug', description: 'The faction id, e.g. renegade', type: 3, required: true },
+                  ],
+                },
+                {
+                  name: 'rank-add',
+                  description: 'Add a rank inside one faction - higher order outranks lower',
+                  type: 1, // SUB_COMMAND
+                  options: [
+                    { name: 'faction', description: 'The faction id, e.g. duty', type: 3, required: true },
+                    { name: 'slug', description: 'Short lowercase id, e.g. sergeant', type: 3, required: true },
+                    { name: 'name', description: 'Display name players see', type: 3, required: true },
+                    { name: 'order', description: 'Position on the ladder, higher outranks lower', type: 4, required: true },
+                  ],
+                },
+                {
+                  name: 'rank-remove',
+                  description: 'Remove a rank from one faction',
+                  type: 1, // SUB_COMMAND
+                  options: [
+                    { name: 'faction', description: 'The faction id, e.g. duty', type: 3, required: true },
+                    { name: 'slug', description: 'The rank id, e.g. sergeant', type: 3, required: true },
+                  ],
+                },
+              ],
+            },
+            {
+              name: 'wipe',
+              description: 'Permadeath: freeze every PDA, leave private threads, start over as a novice',
+              type: 1, // SUB_COMMAND
+              options: [
+                { name: 'player', description: 'The Discord account of the character', type: 6, required: true },
+              ],
+            },
+            {
               name: 'channel',
               description: 'The channel commands belong in',
               type: 2, // SUB_COMMAND_GROUP
@@ -631,6 +684,30 @@ export class DiscordSide {
         flags: MessageFlags.Ephemeral,
       });
       console.log(`[discord] linked ${r.steamId} to ${i.user.tag}`);
+
+      // A fresh stalker starts as a novice: the first link hands out the
+      // stalker BASE identity (inalienable, worn by everyone) and the lowest
+      // rank -- the rank only when none is held yet, because relinking an
+      // account must never demote anybody (owner's decision 2026-08-30).
+      try {
+        const member = await this.guild.members.fetch(i.user.id);
+        const gain = [];
+
+        const base = this.roles?.base();
+        if (base?.RoleId && !member.roles.cache.has(base.RoleId)) gain.push(base.RoleId);
+
+        const ranks = this.roles?.data?.Ranks || [];
+        const holdsAny = ranks.some((rk) => rk.RoleId && member.roles.cache.has(rk.RoleId));
+        const novice = ranks.find((rk) => rk.Slug === 'stalker-novice');
+        if (!holdsAny && novice?.RoleId) gain.push(novice.RoleId);
+
+        if (gain.length) {
+          await member.roles.add(gain, 'first link: a stalker walks in');
+          console.log(`[discord] ${i.user.tag} starts as a stalker`);
+        }
+      } catch (err) {
+        console.warn(`[discord] could not hand out the starting roles: ${err.message}`);
+      }
       return;
     }
 
@@ -690,6 +767,55 @@ export class DiscordSide {
 
     if (group === 'persona') {
       await this.#persona(i, sub);
+      return;
+    }
+
+    if (group === 'faction') {
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      let r;
+      if (sub === 'add') {
+        r = await this.roles.addFaction(
+          i.guild,
+          (i.options.getString('slug') || '').toLowerCase(),
+          i.options.getString('name'),
+          0,
+          i.options.getBoolean('leader') ?? false,
+        );
+      } else if (sub === 'rank-add') {
+        r = await this.roles.addFactionRank(
+          i.guild,
+          (i.options.getString('faction') || '').toLowerCase(),
+          (i.options.getString('slug') || '').toLowerCase(),
+          i.options.getString('name'),
+          i.options.getInteger('order'),
+        );
+      } else if (sub === 'rank-remove') {
+        r = await this.roles.delFactionRank(
+          i.guild,
+          (i.options.getString('faction') || '').toLowerCase(),
+          (i.options.getString('slug') || '').toLowerCase(),
+        );
+      } else {
+        r = await this.roles.delFaction(i.guild, (i.options.getString('slug') || '').toLowerCase());
+      }
+      await i.editReply({ content: r.ok ? 'Done. The game picks it up within seconds.' : ('No: ' + r.why) });
+      return;
+    }
+
+    if (sub === 'wipe' && !group) {
+      const user = i.options.getUser('player');
+      const uid = this.store.steamIdOf(user.id);
+      if (!uid) {
+        await i.reply({ content: 'That Discord account is not linked to any character.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      if (!this.onWipe) {
+        await i.reply({ content: 'Wipe is not wired up.', flags: MessageFlags.Ephemeral });
+        return;
+      }
+      await i.deferReply({ flags: MessageFlags.Ephemeral });
+      const r = await this.onWipe(uid);
+      await i.editReply({ content: r.ok ? `Done: ${user.tag} starts over. The game freezes their PDAs on its own.` : ('No: ' + r.why) });
       return;
     }
 

@@ -141,6 +141,19 @@ export class Store {
     return a < b ? `d:${a}:${b}` : `d:${b}:${a}`;
   }
 
+  // Забыть разговор целиком: следующий start той же пары создаст НОВЫЙ
+  // тред. История остаётся в архиве Discord, но с чистого листа она не
+  // видна -- ради этого и удаляем (permadeath).
+  delConvo(key) {
+    delete this.data.convos[key];
+    delete this.data.messages[key];
+    this.save();
+  }
+
+  allConvoKeys() {
+    return Object.keys(this.data.convos);
+  }
+
   convo(key) {
     return this.data.convos[key] || null;
   }

@@ -554,6 +554,14 @@ const routes = {
     return { ok: true };
   },
 
+  // Permadeath: the game asks, the bridge executes its half. Faction
+  // lifecycle deliberately has NO route -- factions are born and die only
+  // through the bot commands (owner's decision 2026-08-30).
+  '/v1/player/wipe': async ({ Json }) => {
+    const r = await wipePlayer(Json.Uid);
+    return { Ok: !!r.ok, Why: r.why || '' };
+  },
+
   // --- news ---
   '/v1/news/list': async () => news.list(),
   '/v1/news/open': async ({ Json }) => news.open(Json.Id),
@@ -655,6 +663,13 @@ function leaderMay(actor, op, arg, target) {
 
   if (op === 'faction.clear') return { ok: true };
   if (op === 'leader.transfer') return { ok: true };
+
+  // Promote and demote INSIDE his own faction -- the faction rank ladder is
+  // the leader's to run (owner's decision 2026-08-30). The arg is a bare
+  // slug and apply() resolves it against the TARGET's faction, which this
+  // gate just proved is his own. The stalker ranks stay admin-only: they
+  // never pass through here, being a different op.
+  if (op === 'frank.set') return { ok: true };
 
   if (op === 'post.add' || op === 'post.remove') {
     if (!arg || !arg.startsWith(mine + ':')) return { ok: false, why: 'that post does not belong to your faction' };
@@ -792,6 +807,88 @@ function drain({ ServerId, Cursor, Uids, Fresh }) {
   return { Cursor: store.cursor, Items: items };
 }
 
+// PERMADEATH, the bridge half. The character is dead, the PLAYER stays:
+// the Discord link survives, the news he posted survive, the zone channel
+// is public anyway. What goes: membership of every private thread (groups
+// keep running without him, direct threads are forgotten so a new life
+// starts a NEW thread), and every roster role except a fresh novice rank.
+async function wipePlayer(uid) {
+  if (!uid) return { ok: false, why: 'no uid' };
+
+  const link = store.linkOf(uid);
+  const discordId = link?.discordId || '';
+
+  // Приватнi треди: з груп -- геть, директи -- забути цiлком.
+  for (const key of store.allConvoKeys()) {
+    const c = store.convo(key);
+    if (!c || !c.members || !c.members.includes(uid)) continue;
+    if (c.kind !== 'group' && c.kind !== 'direct') continue;
+
+    if (discordId && c.threadId) {
+      try {
+        const th = await discord.client.channels.fetch(c.threadId);
+        await th.members.remove(discordId);
+      } catch {
+        // Тред мiг зникнути, або учасника там уже немає -- запис у сторi
+        // все одно чиститься нижче.
+      }
+    }
+
+    if (c.kind === 'direct') {
+      store.delConvo(key);
+    } else {
+      c.members = c.members.filter((m) => m !== uid);
+      store.putConvo(key, c);
+    }
+  }
+
+  // Ролi: усе геть, новачок назад -- нове життя починається з нуля.
+  if (discordId) {
+    try {
+      const member = await discord.guild.members.fetch({ user: discordId, force: true });
+
+      // The factions he held, noted BEFORE the roles come off: leadership
+      // there may need to pass on, and after the removal nobody remembers.
+      const ledFrom = [];
+      for (const f of roles.data.Factions) {
+        if (!f.Base && f.RoleId && member.roles.cache.has(f.RoleId)) ledFrom.push(f.Slug);
+      }
+
+      // ONE atomic PATCH: strip every registry role and hand out the new
+      // life in the same request. Two array calls would each rebuild the
+      // full list from a cache the other has already outdated -- the same
+      // measured race that once glued a member into two factions.
+      const dropSet = new Set();
+      for (const e of roles.entries()) {
+        if (e.node.RoleId && member.roles.cache.has(e.node.RoleId)) dropSet.add(e.node.RoleId);
+      }
+
+      // A new life starts where every life in the Zone starts: the stalker
+      // base identity plus the novice rank.
+      const fresh = [];
+      const base = roles.base();
+      if (base?.RoleId) fresh.push(base.RoleId);
+      const novice = (roles.data.Ranks || []).find((rk) => rk.Slug === 'stalker-novice');
+      if (novice?.RoleId) fresh.push(novice.RoleId);
+
+      const current = [...member.roles.cache.keys()];
+      const final = current.filter((id) => !dropSet.has(id));
+      for (const id of fresh) if (!final.includes(id)) final.push(id);
+      await member.roles.set(final, 'OpenZone: permadeath, a new life begins');
+
+      const moved = { id: member.id, roleIds: new Set(final) };
+      for (const slug of ledFrom) {
+        await roles.ensureLeadership(discord.guild, slug, 'the leader was wiped', moved);
+      }
+    } catch (err) {
+      return { ok: false, why: 'Discord refused: ' + err.message };
+    }
+  }
+
+  console.log(`[wipe] ${uid} started over`);
+  return { ok: true };
+}
+
 // One player's roles, or null when we cannot answer for him.
 function rolesFor(uid) {
   const link = store.linkOf(uid);
@@ -800,7 +897,9 @@ function rolesFor(uid) {
   const member = discord.memberOf(link.discordId);
   if (!member) return null;
 
-  return roles.resolve(member);
+  // The Discord display name rides along: the admin console shows it next
+  // to the in-game name, and only the projection ever reaches the game.
+  return { ...roles.resolve(member), DName: member.displayName || '' };
 }
 
 http = new HttpSide(cfg, {
@@ -808,6 +907,8 @@ http = new HttpSide(cfg, {
   drain,
   oauthCallback: (req, res) => oauth.callback(req, res),
 });
+
+discord.onWipe = (uid) => wipePlayer(uid);
 
 await discord.start();
 
