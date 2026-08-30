@@ -457,11 +457,17 @@ const routes = {
   '/v1/chat/pair_thaw': async ({ Json }) => pairFreeze(Json.A, Json.B, false),
 
   '/v1/chat/group_add': async ({ Json }) => {
-    const { Uid: uid, Id: key, OtherUid: otherUid } = Json;
+    const { Uid: uid, Id: key, OtherUid: otherUid, Max: max } = Json;
     const c = store.convo(key);
     if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
     if (c.kind !== 'group') return { Error: 'not_group' };
     if (c.members.includes(otherUid)) return { Error: 'already_in' };
+
+    // The ceiling comes from the game's Tuning.json with every invite; the
+    // bridge only holds the roster. Zero (or absent) means no ceiling.
+    if (Number.isInteger(max) && max > 0 && c.members.length >= max) {
+      return { Error: 'group_full' };
+    }
 
     // Nobody lands in a group unasked (owner's decision 2026-08-29): the
     // add files an INVITE, membership waits for the invitee's own click.
