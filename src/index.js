@@ -352,7 +352,13 @@ const routes = {
     const { Uid: uid, Name: name, OtherUid: otherUid, OtherName: otherName } = Json;
     store.rememberName(uid, name);
     store.rememberName(otherUid, otherName);
-    const key = Store.directKey(uid, otherUid);
+
+    // The id comes from the CHARACTER keys, not the SteamIDs: after a
+    // permadeath the same account is a different person, and a key derived
+    // from the pair of SteamIDs would drop that new character straight into
+    // the dead one's conversation, history and all. Membership below stays
+    // SteamIDs -- it is the account that reads and writes.
+    const key = Store.directKey(Json.MyKey || uid, Json.OtherKey || otherUid);
     const c = store.convo(key);
     if (c) return { Id: key };
     await startConversation(key, 'direct', `${name} & ${otherName}`, [uid, otherUid]);
@@ -559,6 +565,15 @@ const routes = {
   // through the bot commands (owner's decision 2026-08-30).
   '/v1/player/wipe': async ({ Json }) => {
     const r = await wipePlayer(Json.Uid);
+
+    // WHO STARTED IT decides who still has work to do. From the game's own
+    // admin console (FromGame) the game has already frozen the character
+    // and sealed his devices, and a push back would do it a second time.
+    // From anywhere else — the bot command, an admin tool — the game has
+    // heard nothing yet, and without this line a wipe reset the Discord
+    // roles while every PDA of the dead character kept working.
+    if (r.ok && !Json.FromGame) queuePush(null, { Uid: Json.Uid }, 'wipe');
+
     return { Ok: !!r.ok, Why: r.why || '' };
   },
 
@@ -816,16 +831,30 @@ function drain({ ServerId, Cursor, Uids, Fresh }) {
 
 // PERMADEATH, the bridge half. The character is dead, the PLAYER stays:
 // the Discord link survives, the news he posted survive, the zone channel
-// is public anyway. What goes: membership of every private thread (groups
-// keep running without him, direct threads are forgotten so a new life
-// starts a NEW thread), and every roster role except a fresh novice rank.
+// is public anyway.
+//
+// WHAT THE SURVIVORS KEEP, and this is the whole rule (owner's decision
+// 2026-08-30): everything. The conversation, the group, the contact, the
+// history — all of it stays exactly where it was. Deleting a thread or a
+// contact would ANNOUNCE THE DEATH: a line that disappears says only one
+// thing, and the PDA never tells anybody that somebody died.
+//
+// What actually happens is that the dead man's ACCOUNT stops being in the
+// room. He is removed from every private thread on the Discord side, so he
+// reads and writes nothing there any more, while the record of the
+// conversation — and every message in it — stays for the people who were
+// in it with him.
+//
+// His next character is a different person: the game addresses contacts by
+// character key, so a new life starts unknown to everyone and its threads
+// are new threads.
 async function wipePlayer(uid) {
   if (!uid) return { ok: false, why: 'no uid' };
 
   const link = store.linkOf(uid);
   const discordId = link?.discordId || '';
 
-  // Приватнi треди: з груп -- геть, директи -- забути цiлком.
+  // З приватних тредiв -- геть, але самi треди лишаються жити.
   for (const key of store.allConvoKeys()) {
     const c = store.convo(key);
     if (!c || !c.members || !c.members.includes(uid)) continue;
@@ -836,17 +865,15 @@ async function wipePlayer(uid) {
         const th = await discord.client.channels.fetch(c.threadId);
         await th.members.remove(discordId);
       } catch {
-        // Тред мiг зникнути, або учасника там уже немає -- запис у сторi
-        // все одно чиститься нижче.
+        // Тред мiг зникнути, або учасника там уже немає -- склад у сторi
+        // все одно виправляється нижче.
       }
     }
 
-    if (c.kind === 'direct') {
-      store.delConvo(key);
-    } else {
-      c.members = c.members.filter((m) => m !== uid);
-      store.putConvo(key, c);
-    }
+    // Зi складу розмови його прибираємо: iнакше наступний ensureThread
+    // запросив би той самий акаунт назад.
+    c.members = c.members.filter((m) => m !== uid);
+    store.putConvo(key, c);
   }
 
   // Ролi: усе геть, новачок назад -- нове життя починається з нуля.
@@ -915,7 +942,13 @@ http = new HttpSide(cfg, {
   oauthCallback: (req, res) => oauth.callback(req, res),
 });
 
-discord.onWipe = (uid) => wipePlayer(uid);
+// The bot command is a wipe started OUTSIDE the game, so the game has to be
+// told: it freezes the character's record and seals his devices on the push.
+discord.onWipe = async (uid) => {
+  const r = await wipePlayer(uid);
+  if (r.ok) queuePush(null, { Uid: uid }, 'wipe');
+  return r;
+};
 
 await discord.start();
 

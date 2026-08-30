@@ -135,19 +135,13 @@ export class Store {
 
   // ---- conversations ----
 
-  // A direct conversation key is DERIVED from the two SteamIDs, so both sides
-  // always arrive at the same key without any registry lookup.
+  // A direct conversation key is DERIVED from the two CHARACTER keys
+  // ("<steamId>#<generation>"), so both sides always arrive at the same key
+  // without any registry lookup — and a character who died leaves his
+  // conversation behind instead of handing it to whoever the account
+  // becomes next.
   static directKey(a, b) {
     return a < b ? `d:${a}:${b}` : `d:${b}:${a}`;
-  }
-
-  // Забыть разговор целиком: следующий start той же пары создаст НОВЫЙ
-  // тред. История остаётся в архиве Discord, но с чистого листа она не
-  // видна -- ради этого и удаляем (permadeath).
-  delConvo(key) {
-    delete this.data.convos[key];
-    delete this.data.messages[key];
-    this.save();
   }
 
   allConvoKeys() {
