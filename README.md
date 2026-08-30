@@ -30,6 +30,29 @@ The bridge closes that gap:
 - Caches recent messages so the PDA still shows history and can queue outgoing
   messages while Discord is unreachable.
 
+## Running
+
+Node.js **20+** and a filled-in `.env` (see `SETUP.md`). Then:
+
+- **Windows**: `.\run.ps1` — or `.\run.ps1 -Loop` to restart on crash.
+- **Linux**: `./run.sh` — or `./run.sh --loop`.
+
+Both scripts check the Node version, install the two dependencies on first
+run, refuse to start without `.env`, and then just run `node src/index.js`.
+
+For unattended hosting:
+
+- **Linux**: a systemd unit ships in `deploy/openzone-bridge.service`; the
+  install commands are at the top of the file. `journalctl -u openzone-bridge -f`
+  for logs.
+- **Windows**: register a Scheduled Task that runs at boot:
+
+  ```
+  schtasks /create /tn OpenZoneBridge /sc onstart /ru SYSTEM /tr "powershell -NoProfile -ExecutionPolicy Bypass -File C:\path\to\openzone-bridge\run.ps1 -Loop"
+  ```
+
+  Adjust the path; the task survives logout, a console window does not.
+
 ## Security
 
 The DayZ server is the only party that talks to the bridge. The shared secret travels

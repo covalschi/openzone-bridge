@@ -1,0 +1,37 @@
+# systemd unit for the OpenZone bridge.
+#
+# Install (paths assume the repo lives in /opt/openzone-bridge):
+#
+#   sudo useradd --system --home /opt/openzone-bridge --shell /usr/sbin/nologin openzone
+#   sudo cp deploy/openzone-bridge.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now openzone-bridge
+#
+# Logs: journalctl -u openzone-bridge -f
+#
+# The bridge reads its configuration from .env in the working directory
+# (dotenv), so there is no EnvironmentFile here on purpose -- one source
+# of truth. Keep .env owned by the service user, mode 600.
+
+[Unit]
+Description=OpenZone bridge (DayZ <-> Discord)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=openzone
+WorkingDirectory=/opt/openzone-bridge
+ExecStart=/usr/bin/node src/index.js
+Restart=always
+RestartSec=5
+
+# The bridge needs nothing outside its own directory and the network.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/openzone-bridge/state
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
