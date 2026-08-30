@@ -644,6 +644,13 @@ const routes = {
 function leaderMay(actor, op, arg, target) {
   if (!actor) return { ok: false, why: 'only a faction leader can do that' };
 
+  // LEAVING IS NOBODY'S PERMISSION BUT YOUR OWN. Joining takes an
+  // invitation you accepted, and the way out has to be symmetrical: with
+  // this gate demanding leadership, the only way to leave a faction was to
+  // ask its leader to expel you -- who may be the person you are leaving.
+  // The leader may leave too; the post passes down on the same change.
+  if (op === 'faction.clear' && actor.id === target.id) return { ok: true };
+
   const view = roles.resolve(actor);
   if (!view.Faction) return { ok: false, why: 'you are not in a faction' };
   if (!view.Posts.includes('leader')) return { ok: false, why: 'only the leader of a faction can do that' };

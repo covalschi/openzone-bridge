@@ -521,7 +521,10 @@ export class Roles {
     // Without them the game receives "stalker-legend" and has nothing to draw
     // but the slug -- which is how a player reads his own rank in lowercase
     // English on a Ukrainian screen.
-    const ranks  = this.data.Ranks.map((r) => ({ Id: r.Slug, DisplayName: r.Label }));
+    // Order travels with the ranks. The game knows the slugs, but which of
+    // them outranks which is the registry's word -- and without it "promote"
+    // cannot exist in the PDA at all.
+    const ranks  = this.data.Ranks.map((r) => ({ Id: r.Slug, DisplayName: r.Label, Order: r.Order || 0 }));
     const traits = this.data.Traits.map((t) => ({ Id: t.Slug, DisplayName: t.Label }));
     const posts  = this.data.Factions.flatMap((f) =>
       (f.Posts || []).map((p) => ({ Id: f.Slug + ':' + p.Slug, DisplayName: p.Label })),
@@ -530,7 +533,7 @@ export class Roles {
     // keeps a catalog per axis for the admin UI, and mixing the two would
     // put sergeants in the posts picker.
     const franks = this.data.Factions.flatMap((f) =>
-      (f.Ranks || []).map((q) => ({ Id: f.Slug + ':' + q.Slug, DisplayName: q.Label })),
+      (f.Ranks || []).map((q) => ({ Id: f.Slug + ':' + q.Slug, DisplayName: q.Label, Order: q.Order || 0 })),
     );
 
     const parts = [];
