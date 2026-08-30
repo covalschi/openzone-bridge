@@ -47,7 +47,11 @@ ok('A sees the conversation', listA.Items.some((i) => i.Id === key));
 ok('B sees the same one', listB.Items.some((i) => i.Id === key));
 
 console.log('--- send from the game ---');
-await call('/v1/chat/send', { Uid: A.uid, Name: A.name, Id: key, Text: 'Проверка связи. Как слышно?' });
+// The probe text carries a per-run nonce: identical texts across runs let a
+// LATE Discord echo of the previous run claim this run's expect, and the
+// line lands unowned (measured 2026-08-30: reruns flipped Mine/name).
+const probe = `Перевірка зв'язку ${Date.now().toString(36)}. Чути?`;
+await call('/v1/chat/send', { Uid: A.uid, Name: A.name, Id: key, Text: probe });
 
 console.log('--- poll: the message arrives only once Discord has it ---');
 const t0 = Date.now();
@@ -59,17 +63,19 @@ const batch = await fetch(BASE + '/v1/poll', {
 const held = Date.now() - t0;
 
 const lines = batch.Items.map((i) => JSON.parse(i.Json));
-ok('poll returned the message', lines.some((l) => l.Text.includes('Как слышно')), `${held} ms, ${batch.Items.length} item(s)`);
+ok('poll returned the message', lines.some((l) => l.Text.includes(probe)), `${held} ms, ${batch.Items.length} item(s)`);
 ok('it is addressed to both members', new Set(lines.map((l) => l.Uid)).size === 2);
 
-const mineForA = lines.find((l) => l.Uid === A.uid);
+// The poll replays from cursor 0, so history — the zone included — rides
+// along; pick OUR line, not merely the first one addressed to A.
+const mineForA = lines.find((l) => l.Uid === A.uid && l.Text.includes(probe));
 ok('A sees it as their own', mineForA?.Mine === true);
 ok('the speaker kept their name', mineForA?.Who === A.name, mineForA?.Who);
 
 console.log('--- read the thread back ---');
 const open = await call('/v1/chat/open', { Uid: B.uid, Id: key, Limit: 20 });
 ok('B can open it', open.Id === key, open.Title);
-ok('the line is in the history', open.Lines.some((l) => l.Text.includes('Как слышно')));
+ok('the line is in the history', open.Lines.some((l) => l.Text.includes(probe)));
 ok('and is NOT B own', open.Lines.at(-1)?.Mine === false);
 
 console.log('--- a stranger cannot open it ---');
@@ -77,10 +83,16 @@ const stranger = await call('/v1/chat/open', { Uid: '76561100000000009', Id: key
 ok('refused', !!stranger.Error, stranger.Error);
 
 console.log('--- group ---');
-const grp = await call('/v1/chat/group_new', { Uid: A.uid, Title: 'Свалка' });
+const grp = await call('/v1/chat/group_new', { Uid: A.uid, Title: 'Звалище' });
 ok('group created', !!grp.Id, grp.Id);
 const add = await call('/v1/chat/group_add', { Uid: A.uid, Id: grp.Id, OtherUid: B.uid });
 ok('B invited', add.ok === true);
+// Nobody lands in a group unasked: the add only files an invite, so the
+// group stays closed to B until B accepts it himself.
+const early = await call('/v1/chat/open', { Uid: B.uid, Id: grp.Id });
+ok('B cannot open before accepting', early.Error === 'no_chat');
+const accept = await call('/v1/chat/invite_accept', { Uid: B.uid, Id: grp.Id });
+ok('B accepted the invite', accept.ok === true);
 const grpOpen = await call('/v1/chat/open', { Uid: B.uid, Id: grp.Id });
 ok('B can open the group', grpOpen.Id === grp.Id, grpOpen.Title);
 
@@ -98,32 +110,3 @@ const bad = await fetch(BASE + '/v1/chat/list', {
 });
 ok('403', bad.status === 403);
 
-console.log('--- notes: Discord is the truth ---');
-const savedNote = await call('/v1/notes/save', {
-  Uid: A.uid, Id: '', Title: 'Тайник', Body: 'два ящики 5.45 пiд пiдлогою', Name: A.name,
-});
-ok('note saved, bridge minted its own id', !!savedNote.Id, savedNote.Id);
-
-const book1 = await call('/v1/notes/list', { Uid: A.uid });
-const mine = (book1.Notes || []).find((n) => n.Id === savedNote.Id);
-ok('note is in the book with its body', !!mine && mine.Body.includes('5.45'));
-
-const resaved = await call('/v1/notes/save', {
-  Uid: A.uid, Id: savedNote.Id, Title: 'Тайник', Body: 'ПЕРЕПИСАНО', Name: A.name,
-});
-ok('resave keeps the id (delete+post, no duplicate)', resaved.Id === savedNote.Id);
-
-const book2 = await call('/v1/notes/list', { Uid: A.uid });
-const after = (book2.Notes || []).filter((n) => n.Id === savedNote.Id);
-ok('still exactly one note', after.length === 1 && after[0].Body === 'ПЕРЕПИСАНО');
-
-ok('a stranger sees an empty book', ((await call('/v1/notes/list', { Uid: B.uid })).Notes || []).every((n) => n.Id !== savedNote.Id));
-
-const ghost = await call('/v1/notes/save', { Uid: A.uid, Id: 'no-such-id', Title: 'x', Body: 'y', Name: A.name });
-ok('editing a missing note is refused, not created', ghost.Error === 'no_note');
-
-const gone = await call('/v1/notes/delete', { Uid: A.uid, Id: savedNote.Id });
-ok('note deleted', gone.ok === true);
-
-const book3 = await call('/v1/notes/list', { Uid: A.uid });
-ok('book no longer holds it', (book3.Notes || []).every((n) => n.Id !== savedNote.Id));

@@ -75,7 +75,15 @@ export class News {
     await this.#warm(ch);
 
     const c = discord.client;
-    c.on('threadCreate', (th) => this.#onThread(th));
+    c.on('threadCreate', async (th) => {
+      const fresh = !this.posts.has(th.id);
+      await this.#onThread(th);
+      // Тільки СПРАВДІ новий пост дзвонить у гру -- редагування мовчать.
+      if (fresh) {
+        const p = this.posts.get(th.id);
+        if (p) this.onFresh?.(p);
+      }
+    });
     c.on('threadUpdate', (_o, th) => this.#onThread(th));
     c.on('threadDelete', (th) => { if (this.posts.delete(th.id)) void 0; });
     // The starter message shares the thread's id -- that is how a forum

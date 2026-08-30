@@ -20,7 +20,6 @@ import { HttpSide } from './http.js';
 import { OAuthSide } from './oauth.js';
 import { LinkCodes } from './codes.js';
 import { Roles } from './roles.js';
-import { Notes } from './notes.js';
 import { News } from './news.js';
 import { Personas } from './personas.js';
 
@@ -124,9 +123,6 @@ roles.useLinks((discordId) => !!store.steamIdOf(discordId));
 
 // The notebook. Discord is the truth for it, same doctrine as chat -- the
 // owner's decision of 2026-08-28, restoring the thin-client spec as written.
-const notes = new Notes(cfg.statePath.replace(/[^\/]+$/, 'notes.json'));
-notes.use(discord, store);
-discord.onNoteMessageDeleted = (channelId, messageId) => notes.onMessageDeleted(channelId, messageId);
 
 // Members of a conversation, as Discord ids, skipping whoever has not linked.
 function discordIdsOf(members) {
@@ -145,17 +141,102 @@ async function startConversation(key, kind, title, members) {
   return key;
 }
 
+// Shared map marks are couriers, not backups: five minutes on the wire,
+// then the message is deleted -- from Discord first, then from the store,
+// so neither reopening nor /older can resurrect it. Owner's decision
+// 2026-08-29: without the TTL, chats turn into permanent marker vaults.
+// One-shot pushes outside the message store: a toast the game shows once.
+// Memory only -- a missed toast is a shrug, the invite itself persists in
+// the store and shows up in the chat list anyway.
+const pendingPushes = [];
+let pushSeq = 0;
+const pushSeen = new Map(); // ServerId -> last seq handed out
+function queuePush(uid, line, kind = 'chat') {
+  pushSeq += 1;
+  // uid null -- розголос: конверт їде кожному серверу один раз, а вже гра
+  // рознесе його всім своїм гравцям.
+  pendingPushes.push({ seq: pushSeq, uid, kind, json: JSON.stringify(line) });
+  while (pendingPushes.length > 200) pendingPushes.shift();
+}
+const stampNow = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
+
+const MARK_TTL_MS = 5 * 60 * 1000;
+const markStale = (m) => typeof m.text === 'string' && m.text.startsWith('[MARK] ')
+  && parseAt(m.at) > 0 && parseAt(m.at) < Date.now() - MARK_TTL_MS;
+
+const selfGranted = new Set();
+async function sweepMarks() {
+  for (const gone of store.expiredMarks(Date.now() - MARK_TTL_MS, parseAt)) {
+    try {
+      if (gone.threadId) await discord.deleteMessage(gone.threadId, gone.id);
+      store.dropMessage(gone.key, gone.id);
+    } catch (err) {
+      // Unknown Message: someone beat us to it -- the store record is all
+      // that is left, so drop it. Missing Permissions: the bot cannot
+      // delete webhook posts without Manage Messages -- try to grant
+      // itself a channel overwrite once (it owns these channels), and if
+      // Discord refuses that too, the guild owner has to tick the box.
+      if (err?.code === 10008) store.dropMessage(gone.key, gone.id);
+      else if (err?.code === 50013 && !selfGranted.has(gone.threadId)) {
+        selfGranted.add(gone.threadId);
+        try {
+          const ch = await discord.client.channels.fetch(gone.threadId);
+          const target = ch.isThread() ? ch.parent : ch;
+          await target.permissionOverwrites.edit(discord.client.user.id, { ManageMessages: true });
+          console.log(`[marks] granted itself Manage Messages in #${target.name}`);
+        } catch (e2) {
+          console.warn(`[marks] cannot self-grant Manage Messages (${e2.message}); ask the guild owner to enable it for the bot role`);
+        }
+      } else if (err?.code !== 50013) {
+        console.warn(`[marks] ttl delete failed: ${err.message}`);
+      }
+    }
+  }
+}
+setInterval(() => sweepMarks().catch((e) => console.warn(`[marks] sweep: ${e.message}`)), 30000);
+
+async function pairFreeze(a, b, frozen) {
+  if (!a || !b) return { Error: 'no_chat' };
+  for (const [key, c] of Object.entries(store.data.convos)) {
+    if (c.kind !== 'direct') continue;
+    if (!c.members.includes(a) || !c.members.includes(b)) continue;
+
+    c.pairFrozen = frozen;
+    store.putConvo(key, c);
+    if (c.threadId) {
+      try { await discord.lockThread(c.threadId, frozen); }
+      catch (err) { console.warn(`[chat] thread lock failed: ${err.message}`); }
+    }
+    return { ok: true };
+  }
+  // No conversation yet -- nothing to freeze, and that is fine.
+  return { ok: true };
+}
+
 const routes = {
   // --- chat ---
 
   '/v1/chat/list': async ({ Json }) => {
-    const { Uid: uid } = Json;
+    const { Uid: uid, Until: untilRaw } = Json;
+    // A frozen device reads its owner's account AS OF the freeze stamp:
+    // everything newer is invisible, and the flag tells the client the
+    // whole page is a reading room. The cut is done here on every request
+    // instead of being cached on the device -- a cache would burn with the
+    // server restart, while Discord remembers everything.
+    const until = untilRaw ? parseAt(untilRaw) : 0;
     // The zone pins itself on top: it is the one conversation everybody
     // has, and burying it under private ones would hide the town square.
     const items = store.convosOf(uid)
+      // A conversation born AFTER the freeze does not exist for the
+      // capsule -- not even as a title in the list. The zone is exempt:
+      // its createdAt is the bridge's install date, not the town
+      // square's founding.
+      .filter((c) => !until || c.kind === 'zone' || !c.createdAt || parseAt(c.createdAt) <= until)
       .sort((a, b) => (a.kind === 'zone' ? -1 : 0) - (b.kind === 'zone' ? -1 : 0))
       .map((c) => {
-      const tail = store.messagesOf(c.key, 1)[0];
+      const tail = until
+        ? [...store.messagesOf(c.key, 1000)].reverse().find((m) => parseAt(m.at) <= until)
+        : store.messagesOf(c.key, 1)[0];
       return {
         Id: c.key,
         Kind: c.kind,
@@ -165,21 +246,30 @@ const routes = {
         LastText: tail?.text || '',
       };
     });
-    return { Items: items };
+    const invites = until ? [] : store.invitesOf(uid)
+      .map((i) => {
+        const ic = store.convo(i.key);
+        return ic ? { Id: i.key, Title: ic.title, From: store.nameOf(i.from) || '' } : null;
+      })
+      .filter(Boolean);
+
+    return { Items: items, Invites: invites, Frozen: !!until };
   },
 
   '/v1/chat/open': async ({ Json }) => {
-    const { Uid: uid, Id: key, Limit: limit } = Json;
+    const { Uid: uid, Id: key, Limit: limit, Until: untilRaw } = Json;
     const c = store.convo(key);
     if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
+    const until = untilRaw ? parseAt(untilRaw) : 0;
 
     // The default view is ONE 8-HOUR WINDOW, anchored to the conversation
     // itself: the window ends at NOW when the talk is live, otherwise at the
     // NEWEST message -- a quiet conversation still opens on its last page
     // instead of an empty one. Everything older loads page by page through
     // /older, each page one more 8-hour window.
-    const all = store.messagesOf(key, 1000);
-    const shown = windowSlice(all, Date.now());
+    let all = store.messagesOf(key, 1000);
+    if (until) all = all.filter((m) => parseAt(m.at) <= until);
+    const shown = windowSlice(all, until || Date.now());
     const trimmed = all.length - shown.length;
 
     return {
@@ -194,11 +284,14 @@ const routes = {
       // cap (the thread very likely goes further back than we remember).
       More: trimmed > 0 || all.length >= 100,
       Before: shown[0]?.id || '',
+      Owner: key.startsWith(`g:${uid}:`),
+      Frozen: !!until || (c.kind === 'direct' && !!c.pairFrozen),
       Lines: shown.map((m) => ({
         At: m.at,
         Who: m.who,
         Text: m.text,
         Mine: m.uid === uid,
+        AUid: m.uid || '',
       })),
     };
   },
@@ -207,16 +300,18 @@ const routes = {
   // has older lines, then from the Discord thread itself -- Discord is the
   // truth and the only party that remembers past our tail.
   '/v1/chat/older': async ({ Json }) => {
-    const { Uid: uid, Id: key, Before: before, Limit: limit } = Json;
+    const { Uid: uid, Id: key, Before: before, Limit: limit, Until: untilRaw } = Json;
     const c = store.convo(key);
     if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
+    const until = untilRaw ? parseAt(untilRaw) : 0;
 
     const page = Math.min(limit || 50, 100);
 
     // 1) the store tail first: the previous 8-hour window, anchored to the
     // newest message OLDER than the current top -- a week-long silence is
     // skipped in one step instead of seven empty pages.
-    const all = store.messagesOf(key, 1000);
+    let all = store.messagesOf(key, 1000);
+    if (until) all = all.filter((m) => parseAt(m.at) <= until);
     let at = before ? all.findIndex((m) => m.id === before) : -1;
     if (at > 0) {
       const older = all.slice(0, at);
@@ -225,20 +320,27 @@ const routes = {
         Id: key,
         More: older.length - chunk.length > 0 || !!c.threadId,
         Before: chunk[0]?.id || before,
-        Lines: chunk.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: m.uid === uid })),
+        Lines: chunk.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: m.uid === uid, AUid: m.uid || '' })),
       };
     }
 
     // 2) the thread itself
     if (!c.threadId) return { Id: key, More: false, Before: before || '', Lines: [] };
     try {
-      const lines = await discord.fetchOlder(c.threadId, before, page);
+      let lines = await discord.fetchOlder(c.threadId, before, page);
+      // The anchor id already sits below the freeze stamp, so Discord pages
+      // are pre-freeze by construction -- the filter only guards the edge
+      // where the anchor itself was the oldest stored line.
+      if (until) lines = lines.filter((m) => parseAt(m.at) <= until);
+      // Stale marks deeper than the store tail: the sweep only walks the
+      // store, so history is the one place they could still leak through.
+      lines = lines.filter((m) => !markStale(m));
       const my = store.nameOf(uid);
       return {
         Id: key,
         More: lines.length === page,
         Before: lines[0]?.id || before || '',
-        Lines: lines.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: my !== '' && m.who === my })),
+        Lines: lines.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: my !== '' && m.who === my, AUid: m.uid || '' })),
       };
     } catch (err) {
       console.warn(`[chat] older fetch failed: ${err.message}`);
@@ -301,7 +403,11 @@ const routes = {
     const c = store.convo(key);
     if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
     if (c.kind !== 'group') return { Error: 'not_group' };
+    // Deleting is the FOUNDER's act alone -- his uid is minted into the
+    // key forever (owner's decision 2026-08-29).
+    if (!key.startsWith(`g:${uid}:`)) return { Error: 'not_owner' };
 
+    store.dropInvitesOf(key);
     delete store.data.convos[key];
     delete store.data.messages[key];
     store.save();
@@ -343,6 +449,13 @@ const routes = {
     return { ok: true };
   },
 
+  // A broken contact freezes the DIRECT conversation between the two:
+  // readable, but mute -- in the game and in the Discord thread alike.
+  // A fresh handshake thaws it. Groups are untouched (owner's decision
+  // 2026-08-29).
+  '/v1/chat/pair_freeze': async ({ Json }) => pairFreeze(Json.A, Json.B, true),
+  '/v1/chat/pair_thaw': async ({ Json }) => pairFreeze(Json.A, Json.B, false),
+
   '/v1/chat/group_add': async ({ Json }) => {
     const { Uid: uid, Id: key, OtherUid: otherUid } = Json;
     const c = store.convo(key);
@@ -350,9 +463,53 @@ const routes = {
     if (c.kind !== 'group') return { Error: 'not_group' };
     if (c.members.includes(otherUid)) return { Error: 'already_in' };
 
-    c.members.push(otherUid);
-    store.putConvo(key, c);
+    // Nobody lands in a group unasked (owner's decision 2026-08-29): the
+    // add files an INVITE, membership waits for the invitee's own click.
+    // The toast rides the ordinary chat-push pipe -- the HUD already knows
+    // how to ring about a line.
+    store.addInvite(key, otherUid, uid);
+    queuePush(otherUid, {
+      Uid: otherUid,
+      Id: '',
+      At: stampNow(),
+      Who: store.nameOf(uid) || '',
+      Text: `Запрошення до групи «${c.title}»`,
+      Mine: false,
+    });
+    return { ok: true };
+  },
+
+  '/v1/chat/invite_accept': async ({ Json }) => {
+    const { Uid: uid, Id: key } = Json;
+    if (!store.hasInvite(key, uid)) return { Error: 'no_chat' };
+    const c = store.convo(key);
+    store.dropInvite(key, uid);
+    if (!c) return { Error: 'no_chat' };
+
+    if (!c.members.includes(uid)) {
+      c.members.push(uid);
+      store.putConvo(key, c);
+    }
     await discord.ensureThread(key, c.title, discordIdsOf(c.members));
+    return { ok: true };
+  },
+
+  '/v1/chat/invite_decline': async ({ Json }) => {
+    store.dropInvite(Json.Id, Json.Uid);
+    return { ok: true };
+  },
+
+  '/v1/chat/group_leave': async ({ Json }) => {
+    const { Uid: uid, Id: key } = Json;
+    const c = store.convo(key);
+    if (!c || !c.members.includes(uid)) return { Error: 'no_chat' };
+    if (c.kind !== 'group') return { Error: 'not_group' };
+    // The creator does not leave -- he deletes: a group whose key names an
+    // absent founder would be deletable by nobody at all.
+    if (key.startsWith(`g:${uid}:`)) return { Error: 'not_owner' };
+
+    c.members = c.members.filter((m) => m !== uid);
+    store.putConvo(key, c);
     return { ok: true };
   },
 
@@ -361,6 +518,9 @@ const routes = {
     store.rememberName(uid, name);
     const c = store.convo(key);
     if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
+
+    // A frozen pair reads its history and says nothing new.
+    if (c.kind === 'direct' && c.pairFrozen) return { Error: 'read_only' };
 
     // The pager is one-way by design: NPC lines come in, nothing goes out.
     // The game hides the input, and this is the fence for a client that
@@ -386,23 +546,6 @@ const routes = {
     // means in practice.
     await discord.say(c.threadId, name, text, uid);
     return { ok: true };
-  },
-
-  // --- notes ---
-  //
-  // The answers wear the same shapes the game's page already parses
-  // (OZ_NoteBook and OZ_NoteRef): one description of the data, not two.
-  '/v1/notes/list': async ({ Json }) => notes.list(Json.Uid),
-
-  '/v1/notes/save': async ({ Json }) => {
-    const { Uid: uid, Id: id, Title: title, Body: body, Name: name } = Json;
-    store.rememberName(uid, name);
-    return await notes.save(uid, id, title, body, name);
-  },
-
-  '/v1/notes/delete': async ({ Json }) => {
-    const { Uid: uid, Id: id } = Json;
-    return await notes.remove(uid, id);
   },
 
   // --- news ---
@@ -542,6 +685,7 @@ function drain({ ServerId, Cursor, Uids, Fresh }) {
   const items = [];
   for (const uid of Uids || []) {
     for (const m of store.since(uid, from)) {
+      const pc = store.convo(m.key);
       items.push({
         Kind: 'chat',
         Json: JSON.stringify({
@@ -551,10 +695,23 @@ function drain({ ServerId, Cursor, Uids, Fresh }) {
           Who: m.who,
           Text: m.text,
           Mine: m.uid === uid,
+          AUid: m.uid || '',
+          Kind: pc ? pc.kind : '',
+          Title: pc ? pc.title : '',
         }),
       });
     }
   }
+
+  // Queued one-shot pushes (invite toasts). A server we have not met yet
+  // starts from "now": stale toasts are not worth replaying.
+  const seenSeq = pushSeen.has(ServerId) ? pushSeen.get(ServerId) : pushSeq;
+  for (const p of pendingPushes) {
+    if (p.seq <= seenSeq) continue;
+    if (p.uid && !(Uids || []).includes(p.uid)) continue;
+    items.push({ Kind: p.kind || 'chat', Json: p.json });
+  }
+  pushSeen.set(ServerId, pushSeq);
 
   // The roster, but ONLY when it changed for this server.
   //
@@ -649,6 +806,7 @@ http = new HttpSide(cfg, {
 await discord.start();
 
 const news = new News();
+news.onFresh = (p) => queuePush(null, { Id: p.Id, Title: p.Title, Who: p.Who, At: p.At }, 'news');
 
 // Typed homes for threads: direct talks and groups each get their own
 // channel; the ids live in the bridge state so a rename survives.

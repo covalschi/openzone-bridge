@@ -54,7 +54,6 @@ export class DiscordSide {
     this.client.on('messageCreate', (m) => this.#incoming(m));
     // Notes follow Discord: a deleted message means a deleted note.
     this.client.on('messageDelete', (m) => {
-      if (m?.channelId && m?.id) this.onNoteMessageDeleted?.(m.channelId, m.id);
     });
 
     // МЕЖА ПОМИЛОК, і вона тут не про охайність.
@@ -996,63 +995,6 @@ export class DiscordSide {
     return this.webhook;
   }
 
-  async ensureNotesChannel(knownId) {
-    const everyoneDeny = [
-      PermissionFlagsBits.SendMessages,
-      PermissionFlagsBits.SendMessagesInThreads,
-      PermissionFlagsBits.CreatePublicThreads,
-      PermissionFlagsBits.CreatePrivateThreads,
-      PermissionFlagsBits.AddReactions,
-    ];
-
-    let ch = null;
-    if (knownId) {
-      ch = await this.client.channels.fetch(knownId).catch(() => null);
-    }
-
-    if (!ch) {
-      // FETCH, not the cache -- the cache starts empty and an empty cache
-      // reads as "no such channel", which builds a duplicate.
-      const all = await this.guild.channels.fetch();
-      ch = all.find((c) => c && c.type === ChannelType.GuildText && c.name === 'нотатники');
-    }
-
-    if (!ch) {
-      ch = await this.guild.channels.create({
-        name: 'нотатники',
-        type: ChannelType.GuildText,
-        topic: 'Нотатники сталкерів. Читати можна, писати — ні: записки ведуться з КПК у грі.',
-        reason: 'OpenZone notebooks',
-      });
-    }
-
-    // Idempotent on purpose: an admin who loosened the channel by hand gets
-    // it tightened back on the next bridge start, because a writable
-    // notebook is a broken promise, not a configuration choice.
-    await ch.permissionOverwrites.set([
-      { id: this.guild.roles.everyone.id, deny: everyoneDeny },
-      {
-        id: this.client.user.id,
-        allow: [
-          PermissionFlagsBits.ViewChannel,
-          PermissionFlagsBits.SendMessages,
-          PermissionFlagsBits.SendMessagesInThreads,
-          // The everyone-deny above binds the bot too unless re-allowed
-          // here -- measured: thread creation answered "Missing Access"
-          // until these two joined the list.
-          PermissionFlagsBits.CreatePrivateThreads,
-          PermissionFlagsBits.CreatePublicThreads,
-          PermissionFlagsBits.ManageThreads,
-          PermissionFlagsBits.ManageWebhooks,
-        ],
-      },
-    ]);
-
-    this.notesChannel = ch;
-    this.notesWebhook = await this.#webhookOn(ch);
-    return ch;
-  }
-
   // The zone: ONE public text channel. A channel, not a thread, on purpose:
   // a thread must be joined to be followed and archives itself after a
   // quiet week; a channel simply sits in the list, which is what a town
@@ -1091,18 +1033,6 @@ export class DiscordSide {
     return ch;
   }
 
-  async makeNoteThread(title, memberDiscordIds) {
-    const th = await this.notesChannel.threads.create({
-      name: title.slice(0, 90),
-      type: ChannelType.PrivateThread,
-      invitable: false,
-      autoArchiveDuration: ThreadAutoArchiveDuration.OneWeek,
-      reason: 'OpenZone notebook',
-    });
-    await this.#invite(th, memberDiscordIds);
-    return th;
-  }
-
   async deleteThread(threadId, reason) {
     const th = await this.client.channels.fetch(threadId).catch(() => null);
     if (th) await th.delete(reason);
@@ -1130,27 +1060,26 @@ export class DiscordSide {
     }
   }
 
-  // A webhook post un-archives the thread for free; the bot fallback posts
-  // plain content -- a note has no speaker line to reconstruct. The webhook
-  // is the NOTES channel's own: a webhook belongs to a channel, and the
-  // chat parent's one cannot reach threads of another channel.
-  async postNote(threadId, name, content) {
-    if (this.notesWebhook) {
-      return await this.notesWebhook.send({
-        threadId,
-        username: (name || 'stalker').slice(0, 80),
-        content,
-        allowedMentions: { parse: [] },
-      });
-    }
-    const th = await this.client.channels.fetch(threadId);
-    return await th.send({ content, allowedMentions: { parse: [] } });
-  }
 
   // A page of thread history BEFORE the given message id (or the newest
   // page when no anchor). Returned oldest-first, each line already shaped
   // for the game: webhook posts wear the speaker's name as the author, our
   // bot fallback posts carry it bolded in the text and are unwrapped here.
+  // Delete one message in a thread or channel. The zone lives in a plain
+  // channel and every other conversation in a thread; channels.fetch
+  // resolves both, so one door serves the whole mark-TTL sweep.
+  async deleteMessage(threadOrChannelId, messageId) {
+    const ch = await this.client.channels.fetch(threadOrChannelId);
+    await ch.messages.delete(messageId);
+  }
+
+  // Lock or unlock a thread: a frozen direct conversation stays readable
+  // in Discord but takes no new messages -- same rule the game enforces.
+  async lockThread(threadId, locked) {
+    const th = await this.client.channels.fetch(threadId);
+    await th.setLocked(locked);
+  }
+
   async fetchOlder(threadId, beforeId, limit) {
     const th = await this.client.channels.fetch(threadId);
     const opts = { limit: Math.min(limit || 50, 100) };
@@ -1183,30 +1112,6 @@ export class DiscordSide {
   async renameThread(threadId, name) {
     const th = await this.client.channels.fetch(threadId);
     await th.setName(name.slice(0, 100));
-  }
-
-  async deleteNoteMessage(threadId, messageId) {
-    if (this.notesWebhook) {
-      try {
-        await this.notesWebhook.deleteMessage(messageId, threadId);
-        return;
-      } catch {
-        // Not a webhook message (bot fallback, or the chat-parent webhook
-        // from before notebooks moved) -- delete as the bot.
-      }
-    }
-    try {
-      const th = await this.client.channels.fetch(threadId);
-      await th.messages.delete(messageId);
-    } catch (err) {
-      // 10008 Unknown Message / 10003 Unknown Channel: the whole point of
-      // this call is "that message must not exist" -- it already does not.
-      // A stale MsgId (someone deleted the message by hand while the bridge
-      // slept, so the gateway prune never saw it) otherwise bricks the note
-      // forever: every resave starts with this delete and dies right here.
-      if (err?.code === 10008 || err?.code === 10003) return;
-      throw err;
-    }
   }
 
   // The news module speaks through a webhook too -- that is what puts the

@@ -169,6 +169,46 @@ export class Store {
     return null;
   }
 
+  // ---- group invites ----
+  //
+  // Nobody lands in a group unasked: the add is an INVITE and joining is
+  // the invitee's own click. Persisted -- an invite must survive a bridge
+  // restart, or a night owl's offer would evaporate before morning.
+
+  addInvite(key, uid, from) {
+    const inv = (this.data.invites ||= {});
+    (inv[key] ||= {})[uid] = { from, at: new Date().toISOString() };
+    this.saveSoon();
+  }
+
+  dropInvite(key, uid) {
+    const inv = this.data.invites?.[key];
+    if (!inv || !(uid in inv)) return false;
+    delete inv[uid];
+    if (!Object.keys(inv).length) delete this.data.invites[key];
+    this.saveSoon();
+    return true;
+  }
+
+  hasInvite(key, uid) {
+    return !!this.data.invites?.[key]?.[uid];
+  }
+
+  invitesOf(uid) {
+    const out = [];
+    for (const [key, m] of Object.entries(this.data.invites || {})) {
+      if (m[uid]) out.push({ key, from: m[uid].from });
+    }
+    return out;
+  }
+
+  dropInvitesOf(key) {
+    if (this.data.invites?.[key]) {
+      delete this.data.invites[key];
+      this.saveSoon();
+    }
+  }
+
   // ---- messages ----
 
   // Returns the assigned cursor, or null when this message was already seen.
@@ -184,6 +224,33 @@ export class Store {
     while (list.length > this.keep) list.shift();
     this.saveSoon();
     return stored;
+  }
+
+  // Shared map marks past their TTL: [{key, threadId, id}]. A mark line in
+  // chat is a courier, not a vault -- the caller deletes each one in
+  // Discord first and then drops it here.
+  expiredMarks(cutoffMs, parseAt) {
+    const out = [];
+    for (const [key, list] of Object.entries(this.data.messages)) {
+      const c = this.data.convos[key];
+      if (!c) continue;
+      for (const m of list) {
+        const t = parseAt(m.at);
+        if (typeof m.text === 'string' && m.text.startsWith('[MARK] ') && t > 0 && t < cutoffMs)
+          out.push({ key, threadId: c.threadId, id: m.id });
+      }
+    }
+    return out;
+  }
+
+  dropMessage(key, id) {
+    const list = this.data.messages[key];
+    if (!list) return false;
+    const at = list.findIndex((m) => m.id === id);
+    if (at < 0) return false;
+    list.splice(at, 1);
+    this.saveSoon();
+    return true;
   }
 
   messagesOf(key, limit) {
