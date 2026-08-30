@@ -37,16 +37,17 @@ Then **Reset Token** and copy it. This IS secret.
 **OAuth2 → URL Generator**:
 
 - Scopes: `bot`, `applications.commands`
-- Bot permissions: *View Channels*, *Send Messages*, *Create Private Threads*,
-  *Send Messages in Threads*, *Manage Threads*, *Read Message History*,
-  *Manage Roles*, **Manage Webhooks**
+- Bot permissions: *View Channels*, *Manage Channels*, *Send Messages*,
+  *Manage Messages*, *Create Private Threads*, *Send Messages in Threads*,
+  *Manage Threads*, *Read Message History*, *Manage Roles*,
+  **Manage Webhooks**
 
 Open the generated URL, pick your test guild, authorise.
 
 Or skip the generator — this is the same set as a number:
 
 ```
-https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&scope=bot%20applications.commands&permissions=361582627840
+https://discord.com/oauth2/authorize?client_id=YOUR_APPLICATION_ID&scope=bot%20applications.commands&permissions=361582636048
 ```
 
 ### Why Manage Webhooks
@@ -64,6 +65,25 @@ either way and says in its first line which of the two it got.
   role and turn on **Manage Webhooks** there — narrower, and enough.
 
 Restart the bridge afterwards; it decides once, at start-up.
+
+### Why Manage Channels
+
+On first run the bridge builds its own furniture: the command channel, the
+homes for direct and group threads, the public `зона` channel, and the
+`новини` forum. Without *Manage Channels* none of them can be created — the
+start-up log then says which channel it wanted and could not make. A guild
+where all of these already exist and are on file can run without it.
+
+### Why Manage Messages
+
+`[MARK]` messages expire five minutes after they are posted, and it is the
+BOT that deletes them — from Discord and from its own store alike, so chats
+cannot serve as free backup storage for map marks. Deleting other authors'
+posts (webhook posts included) needs *Manage Messages*. Without it the sweep
+logs `Missing Permissions` and the marks simply stay (measured live
+2026-08-29). The bot tries to grant itself a channel overwrite once, but
+Discord only lets it grant rights its role already holds — so the box has to
+be ticked by the guild owner either way.
 
 ### The trap
 
