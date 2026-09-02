@@ -428,7 +428,17 @@ const routes = {
   },
 
   '/v1/chat/group_new': async ({ Json }) => {
-    const { Uid: uid, Title: title, Desc: desc } = Json;
+    const { Uid: uid, Title: title, Desc: desc, Max: max } = Json;
+
+    // HOW MANY GROUPS THIS DEVICE MAY FOUND (TZ-4 R-F1.6). The number comes
+    // from the device's profile in the game; the count lives here, because
+    // groups do. Zero or absent means no ceiling.
+    const ceiling = Number(max) || 0;
+    if (ceiling > 0) {
+      const mine = store.convosAll().filter((c) => c.kind === 'group' && c.key.startsWith(`g:${uid}:`)).length;
+      if (mine >= ceiling) return { Error: 'groups_full' };
+    }
+
     const key = `g:${uid}:${Date.now().toString(36)}`;
     await startConversation(key, 'group', title || 'group', [uid]);
     if (desc) {
