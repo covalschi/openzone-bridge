@@ -69,12 +69,21 @@ export class Personas {
 
   // The names this member may post under, besides his own. Admin -> all;
   // a faction leader -> whatever his faction was granted.
+  //
+  // THE LEADER PICKS FROM THIS LIST HIMSELF, and an organisation may hold
+  // several names (owner, 2026-09-01). What he cannot do is mint a persona
+  // or grant one to himself: assigning them is an admin's act alone. The
+  // line runs between "which names we have" and "which one signs this post".
+  //
+  // Read the other way round once and implemented as a single fixed voice
+  // per organisation; that was wrong and is recorded in TZ-6 §1a.
   allowedFor(resolved, isAdmin) {
     if (isAdmin) return Object.keys(this.data.items);
-    if (!resolved || !resolved.Faction) return [];
+    if (!resolved || !resolved.Org) return [];
     if (!resolved.Posts || !resolved.Posts.includes('leader')) return [];
     return Object.entries(this.data.items)
-      .filter(([, p]) => p.factions.includes(resolved.Faction))
+      .filter(([, p]) => p.factions.includes(resolved.Org))
       .map(([name]) => name);
   }
+
 }

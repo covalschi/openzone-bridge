@@ -401,6 +401,10 @@ export class DiscordSide {
 
     let who = selfName || i.member?.displayName || i.user.username;
 
+    // ONE RULE FOR BOTH: whatever allowedFor() hands back is what this person
+    // may sign with -- every persona for an admin, the ones granted to his
+    // organisation for a leader, nothing for anyone else. The leader picks
+    // among his own; that is his to choose (TZ-6 R1.2).
     const as = (i.options.getString('as') || '').trim();
     if (as) {
       const resolved = this.roles && i.member ? this.roles.resolve(i.member) : null;
@@ -978,8 +982,22 @@ export class DiscordSide {
     // tiers of the ladder; a human-typed message must match exactly or not
     // at all -- misattributing a stranger's line is worse than dropping ours.
     const ours = !!m.webhookId || m.author.id === this.client.user.id;
-    let uid = this.#claim(m.channel.id, who, text, ours);
-    if (!uid && !m.webhookId) {
+    // OUR OWN ECHO IS ALREADY HOME -- DO NOT STORE IT TWICE.
+    //
+    // Since TZ-2 the line is written to the store when the game sends it,
+    // under our own id, and Discord is only a surface it may also appear on.
+    // The gateway hands that post straight back to us; storing it again
+    // would put the same sentence in the conversation twice, once under our
+    // id and once under Discord's.
+    //
+    // A claim exists only for lines WE sent, so this cannot swallow anything
+    // a human typed in Discord: those never match and fall through below.
+    const claimed = this.#claim(m.channel.id, who, text, ours);
+    if (claimed)
+      return;
+
+    let uid = null;
+    if (!m.webhookId) {
       uid = this.store.steamIdOf(m.author.id);
       // A linked stalker typing FROM Discord speaks under his game name:
       // the Zone knows one identity, and the Discord nick is not it. The
@@ -995,6 +1013,9 @@ export class DiscordSide {
       who,
       text,
       fromDiscord: !m.webhookId,
+      // It arrived FROM Discord, so Discord has it by definition: this one
+      // the store may drop when the tail runs long.
+      inDiscord: true,
     });
   }
 
@@ -1223,9 +1244,28 @@ export class DiscordSide {
           text = cut[2];
         }
       }
+      // WHO SAID IT, BY ID -- never by name.
+      //
+      // A message typed in Discord carries its author's Discord id, and the
+      // link table turns that into a stalker for any message, however old.
+      // This is the one tier that works at unlimited depth and costs
+      // nothing: the answer is already in the store.
+      //
+      // A webhook post is a line the GAME sent, and its only identity is the
+      // character name the game supplied. Resolving that by name is exactly
+      // the bug this is fixing -- a renamed player loses his own lines and a
+      // namesake inherits them -- so it is left empty and the caller says
+      // "unknown" instead of guessing. The claims ladder that resolves these
+      // live (see #incoming) cannot help here: a claim is matched once, at
+      // echo time, and is gone.
+      let uid = '';
+      if (!m.webhookId && m.author?.id !== this.client.user.id)
+        uid = this.store.steamIdOf(m.author?.id) || '';
+
       out.push({
         id: m.id,
         at: new Date(m.createdTimestamp).toISOString().slice(0, 19).replace('T', ' '),
+        uid,
         who,
         text: byteClip(text),
       });
@@ -1389,7 +1429,12 @@ export class DiscordSide {
     if (tier !== 'exact') {
       console.log(`[discord] echo matched via ${tier} tier (thread ${threadId}); Discord normalised something`);
     }
-    return entry.uid;
+
+    // THE ENTRY, not entry.uid. An anonymous send files a claim whose uid is
+    // null, so returning the uid made "this is our own echo" and "we have
+    // never seen this line" the same answer -- and the echo dedup below
+    // cannot tell them apart from a null.
+    return entry;
   }
 
   async displayName(discordId) {

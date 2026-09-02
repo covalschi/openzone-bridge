@@ -85,7 +85,7 @@ export const DEFAULTS = {
     // the code reads, never the slug: a guild is free to name its base
     // something else, and the game closes its faction screen for whichever
     // faction carries it.
-    { Slug: 'stalker', Label: 'Сталкери', Color: C.stalker, Posts: [], Base: true },
+    { Slug: 'loner', Label: 'Сталкери', Color: C.stalker, Posts: [], Base: true },
     { Slug: 'bandit', Label: 'Бандити', Color: C.bandit,
       Posts: [{ Slug: 'leader', Label: 'Лідер бандитів' }] },
     { Slug: 'clearsky', Label: 'Чисте небо', Color: C.clearsky,
@@ -930,13 +930,36 @@ export class Roles {
       remove.push(id);
       add.push(id);
 
+      // ADD FIRST, REMOVE SECOND -- the order decides what a failure costs.
+      //
+      // It used to be remove-then-add. Two members are involved, so one
+      // atomic PATCH cannot cover both, and the failure mode of that order
+      // is the worst one available: the old leader is already stripped, the
+      // new one never gets the role, and the faction is left WITH NO LEADER
+      // while the reply says the operation failed -- which the game and the
+      // admin both read as "nothing changed". Nobody can hand it back,
+      // because handing it over is a leader's own act.
+      //
+      // This order cannot lose the leader. If the add fails, nothing has
+      // happened at all and the answer is honest. If the remove fails, the
+      // faction briefly has two leaders -- visible in Discord, fixable by
+      // hand -- and the answer says exactly that instead of pretending.
       try {
-        await actor.roles.remove(id, 'OpenZone: leadership handed over');
         await target.roles.add(id, 'OpenZone: leadership handed over');
-        return { ok: true };
       } catch (e) {
         return { ok: false, why: this.#whyDiscordSaidNo(e) };
       }
+
+      try {
+        await actor.roles.remove(id, 'OpenZone: leadership handed over');
+      } catch (e) {
+        return {
+          ok: false,
+          why: `${target.user?.username ?? 'the new leader'} now holds the post, but the old one could not be stripped: ${this.#whyDiscordSaidNo(e)}`,
+        };
+      }
+
+      return { ok: true };
     } else {
       return { ok: false, why: `unknown operation: ${op}` };
     }
@@ -1089,21 +1112,32 @@ export class Roles {
       rank = r.Slug;
     }
 
-    // FACTION: refuse to guess. Faction feeds hostility, and showing no
-    // faction is the safe answer AND makes the misconfiguration visible on
-    // the player's own card, so somebody fixes it.
+    // BELONGING IS TWO AXES, AND THEY TRAVEL SEPARATELY (TZ-1 R8.1).
     //
-    // THE BASE IS NOT A CONFLICT. Everyone wears the stalker role, so
-    // "stalker + duty" is the normal state of every Duty member, and the
-    // REAL faction is the non-stalker one. Only two real factions at once
-    // is the corruption this rule refuses to project.
+    // Base is who you are in the Zone -- everybody is a stalker. Org is who
+    // you stand with, at most one. They are independent: joining Duty does
+    // not stop you being a stalker, and leaving Duty takes the Duty rank
+    // but not the stalker one.
+    //
+    // They used to be collapsed into one field here, with the base kept only
+    // as a fallback when no real faction was held. That threw away the base
+    // for every member of every faction -- which is exactly the half the
+    // contact list needs to say "Сталкер-легенда · Долг".
+    //
+    // ORG REFUSES TO GUESS. Org feeds hostility, and showing no org is the
+    // safe answer AND makes the misconfiguration visible on the player's own
+    // card, so somebody fixes it. Two orgs at once is the corruption this
+    // rule refuses to project -- and it does NOT touch the base: a botched
+    // guild does not stop a person being a stalker (TZ-1 R1.5).
     const held = this.data.Factions.filter((f) => has(f.RoleId));
-    const real = held.filter((f) => !f.Base);
+    const orgs = held.filter((f) => !f.Base);
+    const bases = held.filter((f) => f.Base);
+
+    const base = bases.length > 0 ? bases[0].Slug : '';
     let faction = '';
     let conflict = [];
-    if (real.length === 1) faction = real[0].Slug;
-    if (real.length === 0 && held.length > 0) faction = held[0].Slug;
-    if (real.length > 1) conflict = real.map((f) => f.Slug);
+    if (orgs.length === 1) faction = orgs[0].Slug;
+    if (orgs.length > 1) conflict = orgs.map((f) => f.Slug);
 
     // Posts only count inside the faction actually held. A Duty leader badge
     // on somebody who is not in Duty means nothing.
@@ -1134,7 +1168,7 @@ export class Roles {
     // FACTION RANK: highest wins, same rule as the stalker rank -- and only
     // inside the faction actually held, same rule as the posts.
     let frank = '';
-    if (faction && !this.isBase(faction)) {
+    if (faction) {
       const ff = this.data.Factions.find((x) => x.Slug === faction);
       let fbest = -1;
       for (const q of ff.Ranks || []) {
@@ -1145,7 +1179,7 @@ export class Roles {
       }
     }
 
-    return { Faction: faction, Conflict: conflict, Posts: posts, Rank: rank, FRank: frank, Traits: traits };
+    return { Base: base, Org: faction, Conflict: conflict, Posts: posts, Rank: rank, FRank: frank, Traits: traits };
   }
 }
 

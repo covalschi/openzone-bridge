@@ -130,7 +130,7 @@ openssl rand -hex 32
 ```
 
 - `.env` → `OZ_SHARED_SECRET`
-- the game server's `$profile:OpenZone\Settings.json` → `Bridge.Secret`
+- the game server's `$profile:OpenZone\OZ_Core_Settings.json` → `Bridge.Secret`
 
 `DISCORD_PARENT_CHANNEL_ID` is **required** — the bridge refuses to start without
 it. Every private conversation is a thread, and a thread needs a channel to hang

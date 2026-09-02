@@ -5,16 +5,31 @@
 // readable from every PDA. Exactly the content forums are for, and exactly
 // what the private notebook could not be.
 //
-// Discord is the truth and the ONLY writer: admins post in Discord, the
-// game reads. @everyone loses SendMessages and SendMessagesInThreads on the
-// channel, so the feed stays clean (administrators bypass overwrites).
+// WHERE NEWS LIVE: in the bot's own store. Discord is where they are
+// WRITTEN and a surface they also appear on -- owner's decision 2026-09-01,
+// "пусть бот держит и новости у себя в базе, а дискорд -- только миррор",
+// which is TZ-2 R1.1 for this kind.
 //
-// The index lives in MEMORY only. Unlike notes, the bridge owns no ids
-// here -- the thread snowflake is the post id -- so a restart rebuilds
-// everything from Discord with one warm-up sweep. After that the gateway
-// keeps it fresh: threadCreate/Update/Delete and starter-message edits.
+// This used to say "Discord is the truth and the ONLY writer", and the index
+// lived in MEMORY only, rebuilt from Discord on every start. The cost of that
+// was not obvious until TZ-2 named it: a bot that could not reach the guild
+// had no news AT ALL, so the feed was exactly as optional as Discord was --
+// the thing TZ-2 exists to stop being true.
+//
+// Now the store owns the posts and the guild refreshes them. A restart with
+// Discord unreachable serves what it already had; the warm-up sweep updates
+// rather than creates.
+//
+// Admins still author in Discord: @everyone loses SendMessages and
+// SendMessagesInThreads on the channel, so the feed stays clean
+// (administrators bypass overwrites). The bot may post too -- game events
+// will author news one day.
+//
+// The post id is the thread snowflake. Unlike chat there is nothing for the
+// bot to name itself: the post is created in Discord and arrives with an id.
+//
 // Listing live on every PDA open would cost ~32 REST calls for 30 posts
-// against the global 50/s budget shared with chat; the cache pays once.
+// against the global 50/s budget shared with chat; the store pays once.
 
 import { ChannelType, PermissionFlagsBits } from 'discord.js';
 import { byteClip, GAME_STR_MAX } from './clip.js';
@@ -27,10 +42,24 @@ function stamp(ts) {
 }
 
 export class News {
-  constructor() {
+  // `store` is the home. Without one the feed still works in memory, which
+  // is what every existing test and the old behaviour expect.
+  constructor(store = null) {
     this.discord = null;
     this.channelId = null;
+    this.store = store;
     this.posts = new Map(); // threadId -> { Id, Title, Who, At, ts, Body, Replies }
+
+    // What we already own, before Discord is asked anything. This is the
+    // whole point: news exist even when the guild is unreachable.
+    for (const p of store ? store.newsAll() : []) this.posts.set(p.Id, p);
+  }
+
+  // One place to write, so nothing can update the memory copy and forget
+  // the durable one.
+  #keep(post) {
+    this.posts.set(post.Id, post);
+    this.store?.newsPut(post);
   }
 
   async start(discord, knownId) {
@@ -85,14 +114,14 @@ export class News {
       }
     });
     c.on('threadUpdate', (_o, th) => this.#onThread(th));
-    c.on('threadDelete', (th) => { if (this.posts.delete(th.id)) void 0; });
+    c.on('threadDelete', (th) => { this.posts.delete(th.id); this.store?.newsDrop(th.id); });
     // The starter message shares the thread's id -- that is how a forum
     // post's body edit is told apart from a mere reply.
     c.on('messageCreate', (m) => { if (m.id === m.channelId) this.#onStarter(m); });
     c.on('messageUpdate', (_o, m) => { if (m && m.id === m.channelId) this.#onStarter(m); });
     c.on('messageDelete', (m) => {
       const p = this.posts.get(m.channelId);
-      if (p && m.id === m.channelId) p.Body = '';
+      if (p && m.id === m.channelId) { p.Body = ''; this.#keep(p); }
     });
 
     console.log(`[news] #новини ready, ${this.posts.size} post(s) cached`);
@@ -160,13 +189,17 @@ export class News {
       }
     }
 
-    this.posts.set(th.id, post);
+    this.#keep(post);
 
-    // The cap holds on live inserts too, not only at warm-up.
+    // The cap holds on live inserts too, not only at warm-up. Safe to drop
+    // in a way chat is not: news are authored in Discord and stay there, so
+    // an evicted post is still where it was written.
     if (this.posts.size > KEEP) {
       const oldest = [...this.posts.values()].sort((a, b) => a.ts - b.ts)[0];
       this.posts.delete(oldest.Id);
+      this.store?.newsDrop(oldest.Id);
     }
+    this.store?.newsTrim(KEEP);
   }
 
   #onStarter(m) {
@@ -174,6 +207,7 @@ export class News {
     if (!p) return;
     p.Body = byteClip(m.content || '', BODY_MAX);
     p.Who = m.member?.displayName || m.author?.username || p.Who;
+    this.#keep(p);
   }
 
   list() {

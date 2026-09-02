@@ -87,6 +87,23 @@ const cfg = {
 
 const store = new Store(cfg.statePath);
 
+// OUR OWN ID FOR A RECORD, and it is deliberately not Discord's (TZ-2 R6.4).
+//
+// A Discord messageId is a MUTABLE POINTER, not an identity: any strategy
+// that reposts a line -- a mirror switched on and backfilled, a thread
+// rebuilt after deletion -- changes it, and everything keyed by it comes
+// loose. A record needs a name that belongs to the record.
+//
+// Shape: "o" + milliseconds + counter. Sortable by time like a snowflake, so
+// existing code that orders by id keeps working; the counter makes two lines
+// in the same millisecond distinct. The prefix keeps ours visually apart from
+// Discord's 19-digit numbers in any log or state file.
+let ownSeq = 0;
+function ownId() {
+  ownSeq = (ownSeq + 1) % 100000;
+  return `o${Date.now()}${String(ownSeq).padStart(5, '0')}`;
+}
+
 // Where each server has read up to. Kept per server id, because one bridge
 // can serve several stands and they are not at the same place in the stream.
 const cursors = new Map();
@@ -121,8 +138,25 @@ discord.usePersonas(personas);
 // лідерство й знімала б його з живого лідера.
 roles.useLinks((discordId) => !!store.steamIdOf(discordId));
 
-// The notebook. Discord is the truth for it, same doctrine as chat -- the
-// owner's decision of 2026-08-28, restoring the thin-client spec as written.
+// THE NOTEBOOK IS NOT HERE, AND MUST NOT BE BROUGHT HERE.
+//
+// This said "Discord is the truth for it, same doctrine as chat -- the
+// owner's decision of 2026-08-28". That decision was written down and never
+// built: there is no notes route, no notes storage and no notebook thread in
+// this file or in discord.js. Notes have lived on the DEVICE the whole time,
+// in OZ_PDA_Base.m_NotesJson, and the game's handler never once asks the
+// bridge about them.
+//
+// The decision was then REVERSED (TZ-2 R1.2): the device is their home, and
+// Discord may only ever be a mirror of it, off by default. The reason is the
+// doctrine the whole device stands on -- steal the PDA and you get exactly
+// what is written on it -- and R3.3 spells out the cost of the mirror:
+// a private thread is visible to any moderator holding MANAGE_THREADS, so
+// turning it on hands every player's notes to the guild staff.
+//
+// The comment is kept, rather than deleted, because it nearly cost a
+// rewrite: read as a statement of fact it invites someone to "restore" a
+// path the owner has since cancelled.
 
 // Members of a conversation, as Discord ids, skipping whoever has not linked.
 function discordIdsOf(members) {
@@ -328,6 +362,15 @@ const routes = {
     if (!c.threadId) return { Id: key, More: false, Before: before || '', Lines: [] };
     try {
       let lines = await discord.fetchOlder(c.threadId, before, page);
+
+      // The store still knows the author of anything inside its tail, and
+      // the Discord page overlaps the tail at its edge. Filling those in
+      // from the tail costs one map lookup and recovers every game-relayed
+      // line that has not aged out yet -- the ones Discord itself cannot
+      // attribute, because a webhook post carries no author but a name.
+      const known = new Map();
+      for (const m of store.messagesOf(key, 1000)) if (m.uid) known.set(m.id, m.uid);
+      for (const m of lines) if (!m.uid && known.has(m.id)) m.uid = known.get(m.id);
       // The anchor id already sits below the freeze stamp, so Discord pages
       // are pre-freeze by construction -- the filter only guards the edge
       // where the anchor itself was the oldest stored line.
@@ -335,12 +378,22 @@ const routes = {
       // Stale marks deeper than the store tail: the sweep only walks the
       // store, so history is the one place they could still leak through.
       lines = lines.filter((m) => !markStale(m));
-      const my = store.nameOf(uid);
+      // MINE IS DECIDED BY UID, NEVER BY NAME.
+      //
+      // This compared the reader's CURRENT name to the name on the line, and
+      // both halves of that were wrong: rename yourself and your own history
+      // stops being yours, and a namesake inherits it along with the accent
+      // stripe. Names are the player's to change and the admin's to reuse;
+      // only the id is nobody's to take.
+      //
+      // Unknown author -> not mine, no colour. A line that renders neutral is
+      // a line nobody is lying about; the tiers above recover every case
+      // where the answer is actually knowable.
       return {
         Id: key,
         More: lines.length === page,
         Before: lines[0]?.id || before || '',
-        Lines: lines.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: my !== '' && m.who === my, AUid: m.uid || '' })),
+        Lines: lines.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: !!m.uid && m.uid === uid, AUid: m.uid || '' })),
       };
     } catch (err) {
       console.warn(`[chat] older fetch failed: ${err.message}`);
@@ -432,7 +485,7 @@ const routes = {
   // server is the only caller (it holds the shared secret); the thread is
   // the usual Discord truth, the webhook wears the NPC's name, and the
   // conversation kind 'npc' makes every reader treat it as receive-only.
-  '/v1/npc/say': async ({ Json }) => {
+  '/v1/npc/say': async ({ Json, ServerId }) => {
     const { NpcId: npcId, Name: npcName, Uid: uid, Text: text } = Json;
     if (!npcId || !uid) return { Error: 'no_chat' };
 
@@ -448,10 +501,35 @@ const routes = {
       store.putConvo(key, c);
     }
 
-    // No expect is filed: the echo is claimed by nobody, the stored line
-    // keeps uid null, and the game shows the NPC's name in the Who column
-    // -- the same mechanics the anonymous zone shout uses.
-    await discord.say(c.threadId, npcName || npcId, byteClip(text), null);
+    // HOME FIRST, exactly like an ordinary line (TZ-2 R1.1: chat lives in
+    // the bot). The pager used to depend on the Discord echo to exist at
+    // all, so with the mirror off a scripted NPC would speak into nothing
+    // and the player's device would never show the line.
+    //
+    // uid stays null and the game shows the NPC's name in the Who column --
+    // the same mechanics the anonymous zone shout uses.
+    const npcMirrored = mirrored(ServerId, 'chat');
+
+    const line = store.addMessage(key, {
+      id: ownId(),
+      at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      uid: null,
+      who: npcName || npcId,
+      text: byteClip(text),
+      fromDiscord: false,
+      inDiscord: npcMirrored,
+    });
+    if (line) http?.wake();
+
+    if (npcMirrored) {
+      try {
+        await discord.say(c.threadId, npcName || npcId, byteClip(text), null);
+      } catch (err) {
+        if (line) line.inDiscord = false;
+        console.warn(`[npc] stored but not mirrored: ${err.message}`);
+      }
+    }
+
     return { ok: true };
   },
 
@@ -525,7 +603,7 @@ const routes = {
     return { ok: true };
   },
 
-  '/v1/chat/send': async ({ Json }) => {
+  '/v1/chat/send': async ({ Json, ServerId }) => {
     const { Uid: uid, Name: name, Id: key, Text: text, Anon: anon } = Json;
     store.rememberName(uid, name);
     const c = store.convo(key);
@@ -548,15 +626,59 @@ const routes = {
     // the stored line keeps uid null, and even the sender's own device
     // shows it as not-theirs. Deniability is the point. The real sender
     // is in the game server's log, nowhere else.
-    if (anon && c.kind === 'zone') {
-      await discord.say(c.threadId, 'Невідомий сталкер', text, null);
-      return { ok: true };
+    // STORED FIRST, MIRRORED SECOND. The order is the whole point.
+    //
+    // This used to read "sent, not stored: it becomes part of the
+    // conversation when Discord hands it back over the gateway". That made
+    // Discord the HOME of the chat, not its surface -- and it is why turning
+    // Discord off used to mean losing chat rather than moving it (TZ-2 §2).
+    // With the mirror off, a line sent that way went nowhere and was kept
+    // nowhere: the player watched his own words disappear.
+    //
+    // Now the record is ours from the moment it exists, and Discord is one
+    // more place it may also appear.
+    const who = (anon && c.kind === 'zone') ? 'Невідомий сталкер' : name;
+
+    // Anonymity means the line is claimed by nobody: uid stays null, and even
+    // the sender's own device shows it as not-theirs. Deniability is the
+    // point. The real sender is in the game server's log, nowhere else.
+    const author = (anon && c.kind === 'zone') ? null : uid;
+
+    // Whether this line will also exist in Discord decides whether the store
+    // is allowed to drop it later. Read BEFORE the post, because the answer
+    // is about the configuration, not about whether the post succeeded: a
+    // guild that refused us is not a guild that has the line.
+    const alsoInDiscord = mirrored(ServerId, 'chat');
+
+    const stored = store.addMessage(key, {
+      id: ownId(),
+      at: new Date().toISOString().slice(0, 19).replace('T', ' '),
+      uid: author,
+      who,
+      text: byteClip(text),
+      fromDiscord: false,
+      inDiscord: alsoInDiscord,
+    });
+    if (stored) http?.wake();
+
+    // MIRROR IS A SURFACE, AND FAILING TO REACH IT IS NOT LOSING THE LINE.
+    //
+    // The line is already home. If the guild refuses -- rate limit, missing
+    // permission, deleted thread -- we say so in the log and still answer ok,
+    // because from the player's side the message WAS delivered: it is in his
+    // conversation and every other member will read it.
+    if (alsoInDiscord) {
+      try {
+        await discord.say(c.threadId, who, text, author);
+      } catch (err) {
+        // The guild refused, so the line is NOT there -- say so in the
+        // record, or the store would later drop it believing Discord has a
+        // copy that does not exist.
+        if (stored) stored.inDiscord = false;
+        console.warn(`[chat] stored but not mirrored: ${err.message}`);
+      }
     }
 
-    // Sent, not stored. It becomes part of the conversation when Discord
-    // hands it back over the gateway — that is what "Discord is the truth"
-    // means in practice.
-    await discord.say(c.threadId, name, text, uid);
     return { ok: true };
   },
 
@@ -580,6 +702,97 @@ const routes = {
   // --- news ---
   '/v1/news/list': async () => news.list(),
   '/v1/news/open': async ({ Json }) => news.open(Json.Id),
+
+  // WHICH NAMES THIS PERSON MAY SIGN WITH (TZ-6 R2.1).
+  //
+  // Both surfaces ask before they draw: the PDA to fill a leader's chooser,
+  // the VPP console to fill the admin's. The CLIENT never invents this list
+  // and never decides rights from it -- it draws what it is given, and the
+  // write route checks again anyway. Two checks, because a list is a hint
+  // and a grant is a fact.
+  '/v1/news/voices': async ({ Json }) => {
+    const uid = Json && Json.Uid;
+    const link = uid ? store.linkOf(uid) : null;
+    const member = link ? discord.memberOf(link.discordId) : null;
+    const resolved = member && roles ? roles.resolve(member) : null;
+    const admin = member ? discord.isAdminMember(member) : false;
+
+    return {
+      // The name he signs with when he picks nobody. Empty for someone the
+      // bridge cannot name at all, and the page says so rather than offering
+      // an author it made up.
+      Self: (uid && store.nameOf(uid)) || member?.displayName || '',
+      Admin: admin,
+      Leader: !!(resolved && resolved.Posts && resolved.Posts.includes('leader')),
+      Org: (resolved && resolved.Org) || '',
+      Voices: personas.allowedFor(resolved, admin),
+    };
+  },
+
+  // WRITING a news post from the game (TZ-6 R3.1).
+  //
+  // TWO CALLERS, ONE ROUTE: the admin console in VPP and a faction leader's
+  // PDA. The game checks its own side -- IsAdmin for the console, a device
+  // and a session for the page -- and this checks the other: who may write
+  // at all, and whose voice a persona is.
+  //
+  // Both checks are needed and neither replaces the other. The server decides
+  // who may reach a surface; only the bridge knows who leads what, because
+  // leadership lives in the guild's roles. A server trusted about the second
+  // would let a compromised console speak as anyone.
+  '/v1/news/post': async ({ Json }) => {
+    const { Uid: uid, Who: asName, Title: title, Body: body } = Json;
+
+    if (!title || !String(title).trim()) return { Error: 'no_title' };
+    if (!body || !String(body).trim()) return { Error: 'no_body' };
+
+    const link = uid ? store.linkOf(uid) : null;
+    const member = link ? discord.memberOf(link.discordId) : null;
+    const resolved = member && roles ? roles.resolve(member) : null;
+    const admin = member ? discord.isAdminMember(member) : false;
+
+    // WHO MAY WRITE AT ALL (TZ-6 §2). Admins and faction leaders, nobody
+    // else -- not a member of an organisation, not a linked stalker, not an
+    // unlinked one. Checked before the voice, because "you may not write"
+    // and "that is not your name" are different refusals and the first one
+    // has to come first.
+    const leader = !!(resolved && resolved.Posts && resolved.Posts.includes('leader'));
+    if (!admin && !leader) return { Error: 'not_allowed' };
+
+    // Under his own game name unless he names a voice.
+    let who = (uid && store.nameOf(uid)) || member?.displayName || '';
+
+    // ONE RULE FOR BOTH SURFACES AND BOTH KINDS OF CALLER (TZ-6 R1.2/R1.4).
+    //
+    // allowedFor() is the whole answer: every persona for an admin, the ones
+    // granted to his organisation for a leader, nothing for anyone else. The
+    // leader picks among his own -- an organisation may hold several names,
+    // and choosing between them is his.
+    //
+    // The refusal carries the list, because "not your voice" without saying
+    // which are is the kind of answer that sends someone reading source.
+    const wanted = String(asName || '').trim();
+    if (wanted) {
+      const allowed = personas.allowedFor(resolved, admin);
+      if (!allowed.includes(wanted)) return { Error: 'not_your_voice', Allowed: allowed };
+      who = wanted;
+    } else if (!admin && !who) {
+      // Nobody we can name: an unlinked non-admin has no author at all.
+      return { Error: 'no_author' };
+    }
+
+    if (!who) return { Error: 'no_author' };
+
+    try {
+      await news.post(who, String(title).trim(), String(body));
+      return { ok: true, Who: who };
+    } catch (err) {
+      // Words, not a code: the admin whose post did not appear will go
+      // looking for a fault otherwise (R3.3).
+      console.warn(`[news] post from the game failed: ${err.message}`);
+      return { Error: 'post_failed', Why: err.message };
+    }
+  },
 
   // --- account link ---
 
@@ -666,11 +879,14 @@ function leaderMay(actor, op, arg, target) {
   // The leader may leave too; the post passes down on the same change.
   if (op === 'faction.clear' && actor.id === target.id) return { ok: true };
 
+  // The ORG axis, not the base one: leadership, membership and expulsion
+  // only exist inside an organisation. Everybody is a stalker, and being a
+  // stalker gives authority over nobody (TZ-1 R8.1).
   const view = roles.resolve(actor);
-  if (!view.Faction) return { ok: false, why: 'you are not in a faction' };
+  if (!view.Org) return { ok: false, why: 'you are not in a faction' };
   if (!view.Posts.includes('leader')) return { ok: false, why: 'only the leader of a faction can do that' };
 
-  const mine = view.Faction;
+  const mine = view.Org;
 
   // Taking somebody INTO the faction is the one case where the target is not
   // yet a member, so it is checked against the faction being joined.
@@ -680,7 +896,7 @@ function leaderMay(actor, op, arg, target) {
   }
 
   // Everything else acts on somebody who must already be one of his.
-  const theirs = roles.resolve(target).Faction;
+  const theirs = roles.resolve(target).Org;
   if (theirs !== mine) return { ok: false, why: 'that player is not in your faction' };
 
   if (op === 'faction.clear') return { ok: true };
@@ -715,7 +931,41 @@ const rosterSeen = new Map();
 // player: ServerId -> Map(uid -> the exact JSON we sent).
 const rolesSeen = new Map();
 
-function drain({ ServerId, Cursor, Uids, Fresh }) {
+// WHICH KINDS THIS SERVER SHOWS IN THE GUILD, per server id.
+//
+// The game asserts it on every poll rather than announcing it once: the list
+// is a handful of short strings, and the alternative would have the bot
+// remembering state across its own restarts and disagreeing with the server's
+// file exactly when that file was edited while the bot was down.
+//
+// Absent entry means "we have not heard from that server yet", and that is
+// deliberately NOT the same as "nothing is mirrored" -- see mirrored().
+const mirrors = new Map();
+
+// Off unless the server said otherwise. A bot that has not yet heard the
+// server's configuration must not post to the guild on a guess: the quiet
+// failure (a missing thread) is recoverable, the loud one (private chat
+// spilled into Discord) is not.
+function mirrored(serverId, kind) {
+  const list = mirrors.get(serverId);
+  if (!list) return false;
+  return list.has(kind);
+}
+
+function drain({ ServerId, Cursor, Uids, Fresh, Mirrors }) {
+  if (Array.isArray(Mirrors)) {
+    // Said only when it CHANGES. The list rides every poll -- seven times a
+    // minute per server -- and a line each time would bury the one moment
+    // that matters. Silence here means "still the same".
+    const was = mirrors.get(ServerId);
+    const now = new Set(Mirrors);
+    const same = was && was.size === now.size && [...now].every((k) => was.has(k));
+    if (!same) {
+      const what = Mirrors.length ? Mirrors.join(', ') : 'nothing - the guild stays quiet';
+      console.log(`[mirror] ${ServerId} shows: ${what}`);
+    }
+    mirrors.set(ServerId, now);
+  }
   const from = Number.isInteger(Cursor) ? Cursor : (cursors.get(ServerId) ?? 0);
 
   // The game says so itself when it has just started and remembers nothing.
@@ -952,7 +1202,10 @@ discord.onWipe = async (uid) => {
 
 await discord.start();
 
-const news = new News();
+// The store is the home for news too (owner, 2026-09-01). Passing it here
+// is the whole wiring: News reads what it already owns at construction and
+// writes through on every change.
+const news = new News(store);
 news.onFresh = (p) => queuePush(null, { Id: p.Id, Title: p.Title, Who: p.Who, At: p.At }, 'news');
 
 // Typed homes for threads: direct talks and groups each get their own

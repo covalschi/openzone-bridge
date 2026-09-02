@@ -24,6 +24,19 @@ const EMPTY = {
   messages: {},
   // monotonic counter handed to the game so it can ask for "anything newer"
   cursor: 0,
+  // NEWS, and this is their HOME (TZ-2 R1.1, owner's decision 2026-09-01:
+  // "пусть бот держит и новости у себя в базе, а дискорд -- только миррор").
+  //
+  // They used to live in memory only, rebuilt from Discord on every start --
+  // which meant a bot that could not reach the guild had no news at all, and
+  // the feed was as optional as Discord was. Now the guild refreshes what we
+  // already own.
+  //
+  // Keyed by post id, which for a forum post is the thread snowflake: it is
+  // the id Discord gave the post, and news are authored THERE, so unlike
+  // chat there is nothing for the bot to name itself.
+  news: {},
+
   // Furniture the bot created in the guild and has to find again: key -> id.
   // Ids, never names -- an admin renaming a channel must not make the bot
   // build a second one beside it. Same rule the role roster follows.
@@ -216,6 +229,40 @@ export class Store {
     }
   }
 
+  // ---- news ----
+  //
+  // The store keeps them; the News module decides what a post IS. Nothing
+  // here reads inside a post beyond its id and its timestamp for trimming.
+
+  newsAll() {
+    return Object.values(this.data.news ?? {});
+  }
+
+  newsPut(post) {
+    if (!post || !post.Id) return;
+    this.data.news ??= {};
+    this.data.news[post.Id] = post;
+    this.saveSoon();
+  }
+
+  newsDrop(id) {
+    if (!this.data.news || !(id in this.data.news)) return false;
+    delete this.data.news[id];
+    this.saveSoon();
+    return true;
+  }
+
+  // Oldest out when the feed runs long. Safe to drop here in a way chat is
+  // not: news are authored in Discord and stay there, so an evicted post is
+  // still where it was written.
+  newsTrim(keep) {
+    const all = this.newsAll();
+    if (all.length <= keep) return;
+    all.sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    for (const p of all.slice(0, all.length - keep)) delete this.data.news[p.Id];
+    this.saveSoon();
+  }
+
   // ---- messages ----
 
   // Returns the assigned cursor, or null when this message was already seen.
@@ -228,9 +275,50 @@ export class Store {
     this.data.cursor += 1;
     const stored = { ...msg, cursor: this.data.cursor };
     list.push(stored);
-    while (list.length > this.keep) list.shift();
+    this.#trim(key, list);
     this.saveSoon();
     return stored;
+  }
+
+  // WE MAY ONLY DROP WHAT ALSO EXISTS SOMEWHERE ELSE.
+  //
+  // This used to be one line -- `while (list.length > keep) list.shift()` --
+  // and it was harmless while Discord was the truth: the tail was a cache,
+  // and anything shifted off it came back through fetchOlder.
+  //
+  // Since TZ-2 moved chat's HOME here, that stopped being true. A line sent
+  // with the mirror off exists in this list and nowhere else in the world;
+  // shifting it out deletes it, and no /older can bring it back because
+  // Discord never saw it. The eviction of a cache became loss of the record.
+  //
+  // So: drop the oldest line that IS in Discord, and never one that is not.
+  //
+  // A record written before this field existed has no `inDiscord`, and for
+  // those undefined means TRUE: back then Discord was the only path a line
+  // could take, so every one of them is there.
+  #trim(key, list) {
+    while (list.length > this.keep) {
+      const at = list.findIndex((m) => m.inDiscord !== false);
+      if (at < 0) break;
+      list.splice(at, 1);
+    }
+
+    // NOTHING LEFT TO DROP -- and that is a fact the operator has to hear.
+    //
+    // The list is over its bound and every line in it lives only here. We
+    // keep them: losing a player's words silently is worse than a state file
+    // that grows. This is exactly the condition R6.1 names as the reason for
+    // a real database, and it is where "later" turns into "now".
+    if (list.length > this.keep) {
+      this.warned ??= new Set();
+      if (!this.warned.has(key)) {
+        this.warned.add(key);
+        console.warn(
+          `[store] ${key} holds ${list.length} lines and none can be dropped: ` +
+          'they exist nowhere but here. Keeping them all -- this is what TZ-2 R6.1 (SQLite) is for.'
+        );
+      }
+    }
   }
 
   // Shared map marks past their TTL: [{key, threadId, id}]. A mark line in
