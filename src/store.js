@@ -81,6 +81,67 @@ const SCHEMA = [
      key TEXT PRIMARY KEY,
      id  TEXT NOT NULL
    )`,
+  // THE ROLES HOME (TZ-2 section 15, owner 2026-09-02): the catalog of
+  // factions, posts, faction ranks, stalker ranks and traits, and who holds
+  // what. Discord roles are a mirror of these rows, never the other way.
+  `CREATE TABLE IF NOT EXISTS factions (
+     slug       TEXT PRIMARY KEY,
+     label      TEXT NOT NULL,
+     color      INTEGER NOT NULL DEFAULT 13158600,
+     base       INTEGER NOT NULL DEFAULT 0,
+     limit_n    INTEGER NOT NULL DEFAULT 0,
+     role_id    TEXT NOT NULL DEFAULT '',
+     missing    INTEGER NOT NULL DEFAULT 0,
+     ord        INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE TABLE IF NOT EXISTS faction_posts (
+     faction  TEXT NOT NULL,
+     slug     TEXT NOT NULL,
+     label    TEXT NOT NULL,
+     role_id  TEXT NOT NULL DEFAULT '',
+     missing  INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (faction, slug)
+   )`,
+  `CREATE TABLE IF NOT EXISTS faction_ranks (
+     faction  TEXT NOT NULL,
+     slug     TEXT NOT NULL,
+     label    TEXT NOT NULL,
+     ord      INTEGER NOT NULL DEFAULT 0,
+     role_id  TEXT NOT NULL DEFAULT '',
+     missing  INTEGER NOT NULL DEFAULT 0,
+     PRIMARY KEY (faction, slug)
+   )`,
+  `CREATE TABLE IF NOT EXISTS ranks (
+     slug     TEXT PRIMARY KEY,
+     label    TEXT NOT NULL,
+     ord      INTEGER NOT NULL DEFAULT 0,
+     role_id  TEXT NOT NULL DEFAULT '',
+     missing  INTEGER NOT NULL DEFAULT 0
+   )`,
+  `CREATE TABLE IF NOT EXISTS traits (
+     slug     TEXT PRIMARY KEY,
+     label    TEXT NOT NULL,
+     role_id  TEXT NOT NULL DEFAULT '',
+     missing  INTEGER NOT NULL DEFAULT 0
+   )`,
+  // One row per character the bot has ever been told about. Keyed by
+  // Steam64: membership no longer needs a Discord link (R7.1, R7.5).
+  `CREATE TABLE IF NOT EXISTS members (
+     steam_id   TEXT PRIMARY KEY,
+     org        TEXT NOT NULL DEFAULT '',
+     frank      TEXT NOT NULL DEFAULT '',
+     rank       TEXT NOT NULL DEFAULT '',
+     posts      TEXT NOT NULL DEFAULT '[]',
+     traits     TEXT NOT NULL DEFAULT '[]',
+     updated_at TEXT NOT NULL DEFAULT ''
+   )`,
+  `CREATE INDEX IF NOT EXISTS members_org ON members(org)`,
+  // Factions removed from the catalog. The game's roster merge adds and
+  // updates but never deletes on its own, so removals travel by name (R7.9).
+  `CREATE TABLE IF NOT EXISTS factions_gone (
+     slug  TEXT PRIMARY KEY,
+     stamp INTEGER NOT NULL DEFAULT 0
+   )`,
 ];
 
 export class Store {
@@ -179,6 +240,50 @@ export class Store {
       msgAllAsc: q('SELECT json FROM messages WHERE key = ? ORDER BY cursor'),
       msgSince: q('SELECT key, json FROM messages WHERE cursor > ? ORDER BY cursor'),
       msgMarks: q("SELECT key, id, at, text FROM messages WHERE text LIKE '[MARK] %'"),
+
+      // ---- roles home ----
+      facAll: q('SELECT slug, label, color, base, limit_n, role_id, missing, ord FROM factions ORDER BY ord, rowid'),
+      facGet: q('SELECT slug, label, color, base, limit_n, role_id, missing, ord FROM factions WHERE slug = ?'),
+      facSet: q('INSERT INTO factions(slug, label, color, base, limit_n, role_id, missing, ord) VALUES (?, ?, ?, ?, ?, ?, ?, ?) ' +
+                'ON CONFLICT(slug) DO UPDATE SET label = excluded.label, color = excluded.color, base = excluded.base, limit_n = excluded.limit_n, role_id = excluded.role_id, missing = excluded.missing, ord = excluded.ord'),
+      facDel: q('DELETE FROM factions WHERE slug = ?'),
+      facCount: q('SELECT COUNT(*) AS n FROM factions'),
+      facMaxOrd: q('SELECT COALESCE(MAX(ord), 0) AS n FROM factions'),
+
+      postAll: q('SELECT faction, slug, label, role_id, missing FROM faction_posts ORDER BY faction, rowid'),
+      postSet: q('INSERT INTO faction_posts(faction, slug, label, role_id, missing) VALUES (?, ?, ?, ?, ?) ' +
+                 'ON CONFLICT(faction, slug) DO UPDATE SET label = excluded.label, role_id = excluded.role_id, missing = excluded.missing'),
+      postDel: q('DELETE FROM faction_posts WHERE faction = ? AND slug = ?'),
+      postDelFaction: q('DELETE FROM faction_posts WHERE faction = ?'),
+
+      frankAll: q('SELECT faction, slug, label, ord, role_id, missing FROM faction_ranks ORDER BY faction, ord, rowid'),
+      frankSet: q('INSERT INTO faction_ranks(faction, slug, label, ord, role_id, missing) VALUES (?, ?, ?, ?, ?, ?) ' +
+                  'ON CONFLICT(faction, slug) DO UPDATE SET label = excluded.label, ord = excluded.ord, role_id = excluded.role_id, missing = excluded.missing'),
+      frankDel: q('DELETE FROM faction_ranks WHERE faction = ? AND slug = ?'),
+      frankDelFaction: q('DELETE FROM faction_ranks WHERE faction = ?'),
+
+      rankAll: q('SELECT slug, label, ord, role_id, missing FROM ranks ORDER BY ord, rowid'),
+      rankSet: q('INSERT INTO ranks(slug, label, ord, role_id, missing) VALUES (?, ?, ?, ?, ?) ' +
+                 'ON CONFLICT(slug) DO UPDATE SET label = excluded.label, ord = excluded.ord, role_id = excluded.role_id, missing = excluded.missing'),
+      rankDel: q('DELETE FROM ranks WHERE slug = ?'),
+
+      traitAll: q('SELECT slug, label, role_id, missing FROM traits ORDER BY rowid'),
+      traitSet: q('INSERT INTO traits(slug, label, role_id, missing) VALUES (?, ?, ?, ?) ' +
+                  'ON CONFLICT(slug) DO UPDATE SET label = excluded.label, role_id = excluded.role_id, missing = excluded.missing'),
+      traitDel: q('DELETE FROM traits WHERE slug = ?'),
+
+      memGet: q('SELECT steam_id, org, frank, rank, posts, traits, updated_at FROM members WHERE steam_id = ?'),
+      memSet: q('INSERT INTO members(steam_id, org, frank, rank, posts, traits, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) ' +
+                'ON CONFLICT(steam_id) DO UPDATE SET org = excluded.org, frank = excluded.frank, rank = excluded.rank, posts = excluded.posts, traits = excluded.traits, updated_at = excluded.updated_at'),
+      memDel: q('DELETE FROM members WHERE steam_id = ?'),
+      memAll: q('SELECT steam_id, org, frank, rank, posts, traits, updated_at FROM members ORDER BY steam_id'),
+      memOfOrg: q('SELECT steam_id, org, frank, rank, posts, traits, updated_at FROM members WHERE org = ? ORDER BY updated_at, steam_id'),
+      memCountOrg: q('SELECT COUNT(*) AS n FROM members WHERE org = ?'),
+      memCount: q('SELECT COUNT(*) AS n FROM members'),
+
+      goneSet: q('INSERT INTO factions_gone(slug, stamp) VALUES (?, ?) ON CONFLICT(slug) DO UPDATE SET stamp = excluded.stamp'),
+      goneDel: q('DELETE FROM factions_gone WHERE slug = ?'),
+      goneAll: q('SELECT slug FROM factions_gone ORDER BY stamp'),
     };
   }
 
@@ -219,6 +324,9 @@ export class Store {
 
   link(steamId, discordId, discordName) {
     this.q.linkSet.run(steamId, discordId, discordName || '', new Date().toISOString());
+    // One hook for both doors (the /link code and the OAuth page): the roles
+    // home makes the character's row here. Set from index.js.
+    if (this.onLink) this.onLink(steamId, discordId);
   }
 
   linkOf(steamId) {
@@ -235,7 +343,147 @@ export class Store {
   // Everybody who ever linked, oldest first. The admin roster is built from
   // this (TZ-4 R-C4.2): the game itself only knows who is in the Zone.
   linksAll() {
-    return this.q.linkAll.all().map((row) => ({ steamId: row.steam_id, discordId: row.discord_id }));
+    return this.q.linkAll.all().map((row) => ({ steamId: row.steam_id, discordId: row.discord_id, discordName: row.discord_name }));
+  }
+
+  // ---- roles home (TZ-2 section 15) ----
+  //
+  // Rows in, rows out. Every rule about who may hold what lives in roles.js;
+  // this layer only promises that a write is on disk when it returns and
+  // that tx() makes several writes one.
+
+  tx(fn) {
+    return this.#tx(fn);
+  }
+
+  metaGet(key) {
+    return this.#meta(key);
+  }
+
+  metaSet(key, value) {
+    this.#setMeta(key, value);
+  }
+
+  factionsAll() {
+    return this.q.facAll.all().map(rowFaction);
+  }
+
+  factionGet(slug) {
+    const row = this.q.facGet.get(slug);
+    return row ? rowFaction(row) : null;
+  }
+
+  factionSet(f) {
+    let ord = f.ord;
+    if (!(ord > 0)) ord = (this.q.facMaxOrd.get().n || 0) + 1;
+    this.q.facSet.run(f.slug, f.label, Number(f.color) || 0, f.base ? 1 : 0, Math.max(0, Math.floor(Number(f.limit) || 0)), f.roleId || '', f.missing ? 1 : 0, ord);
+  }
+
+  factionDel(slug) {
+    this.q.postDelFaction.run(slug);
+    this.q.frankDelFaction.run(slug);
+    this.q.facDel.run(slug);
+  }
+
+  factionCount() {
+    return this.q.facCount.get().n || 0;
+  }
+
+  postsAll() {
+    return this.q.postAll.all().map((r) => ({ faction: r.faction, slug: r.slug, label: r.label, roleId: r.role_id, missing: !!r.missing }));
+  }
+
+  postSet(p) {
+    this.q.postSet.run(p.faction, p.slug, p.label, p.roleId || '', p.missing ? 1 : 0);
+  }
+
+  postDel(faction, slug) {
+    this.q.postDel.run(faction, slug);
+  }
+
+  franksAll() {
+    return this.q.frankAll.all().map((r) => ({ faction: r.faction, slug: r.slug, label: r.label, ord: r.ord, roleId: r.role_id, missing: !!r.missing }));
+  }
+
+  frankSet(f) {
+    this.q.frankSet.run(f.faction, f.slug, f.label, Math.floor(Number(f.ord) || 0), f.roleId || '', f.missing ? 1 : 0);
+  }
+
+  frankDel(faction, slug) {
+    this.q.frankDel.run(faction, slug);
+  }
+
+  ranksAll() {
+    return this.q.rankAll.all().map((r) => ({ slug: r.slug, label: r.label, ord: r.ord, roleId: r.role_id, missing: !!r.missing }));
+  }
+
+  rankSet(r) {
+    this.q.rankSet.run(r.slug, r.label, Math.floor(Number(r.ord) || 0), r.roleId || '', r.missing ? 1 : 0);
+  }
+
+  rankDel(slug) {
+    this.q.rankDel.run(slug);
+  }
+
+  traitsAll() {
+    return this.q.traitAll.all().map((r) => ({ slug: r.slug, label: r.label, roleId: r.role_id, missing: !!r.missing }));
+  }
+
+  traitSet(t) {
+    this.q.traitSet.run(t.slug, t.label, t.roleId || '', t.missing ? 1 : 0);
+  }
+
+  traitDel(slug) {
+    this.q.traitDel.run(slug);
+  }
+
+  memberGet(steamId) {
+    const row = this.q.memGet.get(steamId);
+    return row ? rowMember(row) : null;
+  }
+
+  memberSet(m) {
+    this.q.memSet.run(
+      m.steamId,
+      m.org || '',
+      m.frank || '',
+      m.rank || '',
+      JSON.stringify(Array.isArray(m.posts) ? m.posts : []),
+      JSON.stringify(Array.isArray(m.traits) ? m.traits : []),
+      new Date().toISOString(),
+    );
+  }
+
+  memberDel(steamId) {
+    this.q.memDel.run(steamId);
+  }
+
+  membersAll() {
+    return this.q.memAll.all().map(rowMember);
+  }
+
+  membersOf(org) {
+    return this.q.memOfOrg.all(org).map(rowMember);
+  }
+
+  memberCountOf(org) {
+    return this.q.memCountOrg.get(org).n || 0;
+  }
+
+  memberCount() {
+    return this.q.memCount.get().n || 0;
+  }
+
+  goneAdd(slug, stamp) {
+    this.q.goneSet.run(slug, stamp);
+  }
+
+  goneForget(slug) {
+    this.q.goneDel.run(slug);
+  }
+
+  goneAll() {
+    return this.q.goneAll.all().map((r) => r.slug);
   }
 
   // ---- game names ----
@@ -559,4 +807,16 @@ export class Store {
 
     return rep;
   }
+}
+
+function rowFaction(r) {
+  return { slug: r.slug, label: r.label, color: r.color, base: !!r.base, limit: r.limit_n, roleId: r.role_id, missing: !!r.missing, ord: r.ord };
+}
+
+function rowMember(r) {
+  let posts = [];
+  let traits = [];
+  try { posts = JSON.parse(r.posts || '[]'); } catch { posts = []; }
+  try { traits = JSON.parse(r.traits || '[]'); } catch { traits = []; }
+  return { steamId: r.steam_id, org: r.org, frank: r.frank, rank: r.rank, posts, traits, updatedAt: r.updated_at };
 }

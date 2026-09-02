@@ -2,7 +2,7 @@
   "name": "openzone-bridge",
   "version": "0.1.0",
   "private": true,
-  "description": "Connects a DayZ server running OpenZone to a Discord guild. Discord is the source of truth; the game mirrors it.",
+  "description": "Connects a DayZ server running OpenZone to a Discord guild. The bot's SQLite is the home of chat, news and roles; Discord and the game mirror it.",
   "type": "module",
   "main": "src/index.js",
   "scripts": {

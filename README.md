@@ -25,8 +25,10 @@ The bridge closes that gap:
   visible only to its participants. Threads, not channels: a guild is capped at 500
   channels, which a server with active players would exhaust, while archived threads
   are unlimited.
-- Mirrors faction and rank changes onto Discord roles, and reads role membership back
-  into the game — with the direction of authority declared per mapping.
+- Keeps factions, posts, ranks and traits, and who holds what, in its own SQLite
+  tables (keyed by Steam64, no Discord link required) and mirrors them onto Discord
+  roles when the roles mirror is on — one direction: a role edited by hand in the
+  guild is put back from the tables.
 - Caches recent messages so the PDA still shows history and can queue outgoing
   messages while Discord is unreachable.
 
@@ -89,7 +91,7 @@ the bridge's own echo suppressed so a player never sees his line twice.
 Not production-ready, and the gaps are named rather than hidden: no HTTPS (a plain
 `node:http` listener, while the shared secret travels in the body), no outbound
 queue or retry, no rate limiting, no input validation, no process supervision, no
-health check anybody reads. Discord role mirroring is designed and not built.
+health check anybody reads.
 
 Run it behind a TLS terminator and treat `OZ_SHARED_SECRET` as what it is:
 credentials to every player's private conversations.

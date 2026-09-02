@@ -24,6 +24,7 @@ import { HttpSide } from './http.js';
 import { OAuthSide } from './oauth.js';
 import { LinkCodes } from './codes.js';
 import { Roles } from './roles.js';
+import { RolesMirror } from './roles-mirror.js';
 import { News } from './news.js';
 import { Personas } from './personas.js';
 
@@ -128,15 +129,39 @@ discord.useCodes(codes);
 // The roster lives in its own file, not in the bridge state: store.save()
 // rewrites the whole state document on every single chat message, and role
 // ids have no business riding that.
-const roles = new Roles(join(dirname(cfg.dbPath), 'roles.json'));
+// THE ROLES HOME IS THE STORE (TZ-2 section 15). The old JSON registry is
+// read exactly once, on the first start after the move, to carry the
+// guild's role ids and the admin's renames into the tables.
+const roles = new Roles(store);
+{
+  const boot = roles.bootstrap(join(dirname(cfg.dbPath), 'roles.json'));
+  let said = `[roles] catalog: ${roles.factions().length} factions from ${boot.source}`;
+  if (boot.grew.length) said += `; new in this version: ${boot.grew.join(', ')}`;
+  console.log(said);
+}
+
+// Discord follows the tables when a server mirrors the kind `roles`.
+// anyMirrored() is declared further down; it is only ever CALLED after the
+// module has finished loading, so the reference is safe.
+const rolesMirror = new RolesMirror(roles, store, { isOn: () => anyMirrored('roles') });
 discord.useRoles(roles);
+discord.useRolesMirror(rolesMirror);
 const personas = new Personas('./state/personas.json');
 discord.usePersonas(personas);
 
 // Реєстр мусить уміти спитати, чи прив'язаний акаунт: без цього роль на
 // комусь, хто ніколи не заходив у гру, рахувалась би як претензія на
 // лідерство й знімала б його з живого лідера.
-roles.useLinks((discordId) => !!store.steamIdOf(discordId));
+// A link is how a character first becomes somebody the bot knows: the row
+// is made on the spot (a plain stalker of the lowest rank) and, when the
+// roles mirror is on, the guild member gets the roles to match. Both doors
+// -- the /link code and the OAuth page -- end in store.link().
+store.onLink = (steamId) => {
+  roles.ensureMember(steamId);
+  rolesMirror.projectMember(discord.guild, steamId, 'first link').catch((e) => {
+    console.warn(`[roles] could not project the new link: ${e.message}`);
+  });
+};
 
 // THE NOTEBOOK IS NOT HERE, AND MUST NOT BE BROUGHT HERE.
 //
@@ -781,7 +806,7 @@ const routes = {
     const uid = Json && Json.Uid;
     const link = uid ? store.linkOf(uid) : null;
     const member = link ? discord.memberOf(link.discordId) : null;
-    const resolved = member && roles ? roles.resolve(member) : null;
+    const resolved = uid ? roles.viewOf(uid) : null;
     const admin = member ? discord.isAdminMember(member) : false;
 
     return {
@@ -815,7 +840,7 @@ const routes = {
 
     const link = uid ? store.linkOf(uid) : null;
     const member = link ? discord.memberOf(link.discordId) : null;
-    const resolved = member && roles ? roles.resolve(member) : null;
+    const resolved = uid ? roles.viewOf(uid) : null;
     const admin = member ? discord.isAdminMember(member) : false;
 
     // WHO MAY WRITE AT ALL (TZ-6 §2). Admins and faction leaders, nobody
@@ -910,48 +935,89 @@ const routes = {
   // only then does the game write Mirror: true. Idempotent -- see mirror.js.
   '/v1/mirror/fill': async ({ Json }) => {
     if (!discord.guild) return { Ok: false, Why: 'the bot is not connected', Pushed: 0, Skipped: 0, Failed: 0, Note: '' };
-    const r = await fillMirror({ store, discord, kind: String(Json.Kind || '') });
+    const kind = String(Json.Kind || '');
+    // The roles kind is a different fill: not lines into threads but the
+    // catalog into roles and every known member onto his roles (R7.6).
+    let r;
+    if (kind === 'roles') r = await rolesMirror.fillAll(discord.guild);
+    else r = await fillMirror({ store, discord, kind });
     return { Ok: r.ok, Why: r.why, Pushed: r.pushed, Skipped: r.skipped, Failed: r.failed, Note: r.note };
   },
 
-  '/v1/roles/roster': async () => {
-    if (!discord.guild) return { Ok: false, Why: 'the bot is not connected', Rows: [] };
+  // The faction editor -- the VPP FACTIONS pane (R7.8). Admin only: the game
+  // sends Admin for its console, and the bot's own commands are the other
+  // door into the same rows.
+  '/v1/factions/upsert': async ({ Json }) => {
+    if (!Json || !Json.Admin) return { Ok: false, Why: 'admins only' };
+    const r = roles.upsertFaction({
+      slug: Json.Slug,
+      label: Json.Label,
+      limit: Json.Limit === undefined ? undefined : Number(Json.Limit) || 0,
+      hasLeader: Json.HasLeader === undefined ? undefined : !!Json.HasLeader,
+    });
+    if (!r.ok) return { Ok: false, Why: r.why };
+    console.log(`[roles] admin ${r.created ? 'created' : 'changed'} faction ${r.slug}`);
+    rolesMirror.afterCatalog(discord.guild, r, 'faction edited in the game').catch((e) => {
+      console.warn(`[roles] mirror did not follow the faction edit: ${e.message}`);
+    });
+    return { Ok: true, Why: '', Created: r.created };
+  },
 
+  '/v1/factions/remove': async ({ Json }) => {
+    if (!Json || !Json.Admin) return { Ok: false, Why: 'admins only' };
+    const r = roles.removeFaction(Json.Slug);
+    if (!r.ok) return { Ok: false, Why: r.why };
+    console.log(`[roles] admin removed faction ${r.slug}`);
+    rolesMirror.afterCatalog(discord.guild, r, 'faction removed in the game').catch((e) => {
+      console.warn(`[roles] mirror did not follow the removal: ${e.message}`);
+    });
+    return { Ok: true, Why: '', Moved: r.touched.length };
+  },
+
+  // Everybody the bot knows -- members of the tables and linked accounts
+  // alike -- for the admin console (TZ-4 R-C4.2). No guild needed: the
+  // tables are the home. The game adds the online players the bot has never
+  // heard of itself.
+  '/v1/roles/roster': async () => {
     const rows = [];
+    const seen = new Set();
+    for (const m of roles.membersAll()) {
+      const v = rolesFor(m.steamId);
+      if (!v) continue;
+      rows.push({ Uid: m.steamId, ...v });
+      seen.add(m.steamId);
+    }
     for (const l of store.linksAll()) {
-      const v = rolesFor(l.steamId);
-      if (v) rows.push({ Uid: l.steamId, ...v });
+      if (seen.has(l.steamId)) continue;
+      // Linked before the move and never assigned anything: the bot still
+      // knows the name, and the console should list him.
+      const member = discord.memberOf(l.discordId);
+      rows.push({ Uid: l.steamId, Base: roles.base()?.slug || '', Org: '', Conflict: [], Posts: [], Rank: '', FRank: '', Traits: [], DName: member?.displayName || l.discordName || '' });
     }
     return { Ok: true, Why: '', Rows: rows };
   },
 
+  // A membership change from the game. The row is written first and the
+  // answer comes from the row; the guild follows afterwards when the roles
+  // mirror is on, and a Discord failure never turns this into a refusal
+  // (R7.4). A Discord link is not required of anybody (R7.5).
   '/v1/roles/apply': async ({ Json }) => {
-    if (!discord.guild) return { Ok: false, Why: 'the bot is not connected' };
-
-    const targetLink = store.linkOf(Json.TargetUid);
-    if (!targetLink) return { Ok: false, Why: 'that player has not linked a Discord account' };
-
-    const target = discord.memberOf(targetLink.discordId);
-    if (!target) return { Ok: false, Why: 'that player is not in this Discord server' };
-
-    // The actor is absent for an admin action -- the game vouches for it.
-    let actor = null;
-    if (Json.ActorUid) {
-      const actorLink = store.linkOf(Json.ActorUid);
-      if (!actorLink) return { Ok: false, Why: 'you have not linked a Discord account' };
-      actor = discord.memberOf(actorLink.discordId);
-      if (!actor) return { Ok: false, Why: 'you are not in this Discord server' };
-    }
+    const target = String(Json.TargetUid || '').trim();
+    if (!target) return { Ok: false, Why: 'no target' };
+    const actor = String(Json.ActorUid || '').trim();
 
     if (!Json.Admin) {
       const gate = leaderMay(actor, Json.Op, Json.Arg, target);
       if (!gate.ok) return { Ok: false, Why: gate.why };
     }
 
-    const r = await roles.apply(discord.guild, actor, target, Json.Op, Json.Arg, Number(Json.Max) || 0);
+    const r = roles.apply(actor, target, Json.Op, Json.Arg, Number(Json.Max) || 0);
     if (!r.ok) return { Ok: false, Why: r.why };
 
-    console.log(`[roles] ${Json.Admin ? 'admin' : Json.ActorUid} ${Json.Op} ${Json.Arg || ''} -> ${Json.TargetUid}`);
+    console.log(`[roles] ${Json.Admin ? 'admin' : actor} ${Json.Op} ${Json.Arg || ''} -> ${target}`);
+    rolesMirror.afterApply(discord.guild, r.touched).catch((e) => {
+      console.warn(`[roles] mirror did not follow ${Json.Op}: ${e.message}`);
+    });
     return { Ok: true, Why: '' };
   },
 };
@@ -966,17 +1032,15 @@ function leaderMay(actor, op, arg, target) {
   if (!actor) return { ok: false, why: 'only a faction leader can do that' };
 
   // LEAVING IS NOBODY'S PERMISSION BUT YOUR OWN. Joining takes an
-  // invitation you accepted, and the way out has to be symmetrical: with
-  // this gate demanding leadership, the only way to leave a faction was to
-  // ask its leader to expel you -- who may be the person you are leaving.
-  // The leader may leave too; the post passes down on the same change.
-  if (op === 'faction.clear' && actor.id === target.id) return { ok: true };
+  // invitation you accepted, and the way out has to be symmetrical. The
+  // leader may leave too; the post passes down on the same change.
+  if (op === 'faction.clear' && actor === target) return { ok: true };
 
   // The ORG axis, not the base one: leadership, membership and expulsion
   // only exist inside an organisation. Everybody is a stalker, and being a
   // stalker gives authority over nobody (TZ-1 R8.1).
-  const view = roles.resolve(actor);
-  if (!view.Org) return { ok: false, why: 'you are not in a faction' };
+  const view = roles.viewOf(actor);
+  if (!view || !view.Org) return { ok: false, why: 'you are not in a faction' };
   if (!view.Posts.includes('leader')) return { ok: false, why: 'only the leader of a faction can do that' };
 
   const mine = view.Org;
@@ -989,8 +1053,8 @@ function leaderMay(actor, op, arg, target) {
   }
 
   // Everything else acts on somebody who must already be one of his.
-  const theirs = roles.resolve(target).Org;
-  if (theirs !== mine) return { ok: false, why: 'that player is not in your faction' };
+  const theirs = roles.viewOf(target);
+  if (!theirs || theirs.Org !== mine) return { ok: false, why: 'that player is not in your faction' };
 
   if (op === 'faction.clear') return { ok: true };
   if (op === 'leader.transfer') return { ok: true };
@@ -1067,6 +1131,13 @@ function drain({ ServerId, Cursor, Uids, Fresh, Mirrors }) {
       console.log(`[mirror] ${ServerId} shows: ${what}`);
     }
     mirrors.set(ServerId, now);
+
+    // The roles mirror just came on for this server -- a restart of the bot
+    // with the setting already on, or the game recording it after a fill.
+    // Make the guild match once; warm() is idempotent and guarded.
+    if (now.has('roles') && !(was && was.has('roles'))) {
+      rolesMirror.warm(discord.guild).catch((e) => console.warn(`[roles] warm failed: ${e.message}`));
+    }
   }
   const from = Number.isInteger(Cursor) ? Cursor : (cursors.get(ServerId) ?? 0);
 
@@ -1246,64 +1317,31 @@ async function wipePlayer(uid, serverId = '') {
     }
   }
 
-  // Ролi: усе геть, новачок назад -- нове життя починається з нуля.
-  if (discordId) {
-    try {
-      const member = await discord.guild.members.fetch({ user: discordId, force: true });
-
-      // The factions he held, noted BEFORE the roles come off: leadership
-      // there may need to pass on, and after the removal nobody remembers.
-      const ledFrom = [];
-      for (const f of roles.data.Factions) {
-        if (!f.Base && f.RoleId && member.roles.cache.has(f.RoleId)) ledFrom.push(f.Slug);
-      }
-
-      // ONE atomic PATCH: strip every registry role and hand out the new
-      // life in the same request. Two array calls would each rebuild the
-      // full list from a cache the other has already outdated -- the same
-      // measured race that once glued a member into two factions.
-      const dropSet = new Set();
-      for (const e of roles.entries()) {
-        if (e.node.RoleId && member.roles.cache.has(e.node.RoleId)) dropSet.add(e.node.RoleId);
-      }
-
-      // A new life starts where every life in the Zone starts: the stalker
-      // base identity plus the novice rank.
-      const fresh = [];
-      const base = roles.base();
-      if (base?.RoleId) fresh.push(base.RoleId);
-      const novice = (roles.data.Ranks || []).find((rk) => rk.Slug === 'stalker-novice');
-      if (novice?.RoleId) fresh.push(novice.RoleId);
-
-      const current = [...member.roles.cache.keys()];
-      const final = current.filter((id) => !dropSet.has(id));
-      for (const id of fresh) if (!final.includes(id)) final.push(id);
-      await member.roles.set(final, 'OpenZone: permadeath, a new life begins');
-
-      const moved = { id: member.id, roleIds: new Set(final) };
-      for (const slug of ledFrom) {
-        await roles.ensureLeadership(discord.guild, slug, 'the leader was wiped', moved);
-      }
-    } catch (err) {
-      return { ok: false, why: 'Discord refused: ' + err.message };
-    }
+  // Roles: everything off, novice back -- a new life starts from zero. The
+  // rows are the home; the guild follows when the roles mirror is on, and
+  // a Discord failure does not undo the wipe (R7.11).
+  {
+    const w = roles.wipe(uid);
+    rolesMirror.afterApply(discord.guild, w.touched, 'permadeath, a new life begins').catch((e) => {
+      console.warn(`[roles] mirror did not follow the wipe: ${e.message}`);
+    });
   }
 
   console.log(`[wipe] ${uid} started over`);
   return { ok: true };
 }
 
-// One player's roles, or null when we cannot answer for him.
+// One player's roles, or null when the bot has never heard of him.
+//
+// From the tables, never the guild (R7.3). The Discord display name rides
+// along when there is a link: the admin console shows it next to the
+// in-game name.
 function rolesFor(uid) {
+  const view = roles.viewOf(uid);
+  if (!view) return null;
   const link = store.linkOf(uid);
-  if (!link) return null;
-
-  const member = discord.memberOf(link.discordId);
-  if (!member) return null;
-
-  // The Discord display name rides along: the admin console shows it next
-  // to the in-game name, and only the projection ever reaches the game.
-  return { ...roles.resolve(member), DName: member.displayName || '' };
+  const member = link ? discord.memberOf(link.discordId) : null;
+  return { ...view, DName: member?.displayName || link?.discordName || '' };
 }
 
 http = new HttpSide(cfg, {
@@ -1321,6 +1359,20 @@ discord.onWipe = async (uid) => {
 };
 
 await discord.start();
+
+// The first start after the move carries the guild's roles into the tables
+// (R7.10). Once; the marker is set only after a real attempt.
+try {
+  await rolesMirror.importIfNeeded(discord.guild);
+} catch (e) {
+  console.warn(`[roles] import from Discord failed: ${e.message}; it will be tried on the next start`);
+}
+
+// Manual edits in the guild are put back on the member update event; the
+// sweep catches whatever the gateway did not deliver (R7.6).
+setInterval(() => {
+  rolesMirror.reconcileAll(discord.guild, 'sweep').catch((e) => console.warn(`[roles] sweep failed: ${e.message}`));
+}, 10 * 60 * 1000).unref();
 
 // The store is the home for news too (owner, 2026-09-01). Passing it here
 // is the whole wiring: News reads what it already owns at construction and

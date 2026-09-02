@@ -82,7 +82,13 @@ export class DiscordSide {
     // Keeps members.cache honest after the initial fetch: discord.js
     // replaces the cached member on each of these, so role changes made in
     // Discord reach the game on the next poll rather than the next restart.
-    this.client.on('guildMemberUpdate', (o, n) => { if (n && n.guild) n.guild.members.cache.set(n.id, n); });
+    this.client.on('guildMemberUpdate', (o, n) => {
+      if (n && n.guild) n.guild.members.cache.set(n.id, n);
+      // A hand on the roles in Discord: the mirror puts the row back (R7.6).
+      if (this.rolesMirror && n) {
+        this.rolesMirror.onMemberUpdate(n).catch((e) => console.warn(`[roles] revert failed: ${e.message}`));
+      }
+    });
     this.client.on('guildMemberAdd', (m) => { if (m && m.guild) m.guild.members.cache.set(m.id, m); });
 
     // Канал видалили посеред сеансу -- ПЕРЕСТАЄМО спрямовувати.
@@ -407,7 +413,7 @@ export class DiscordSide {
     // among his own; that is his to choose (TZ-6 R1.2).
     const as = (i.options.getString('as') || '').trim();
     if (as) {
-      const resolved = this.roles && i.member ? this.roles.resolve(i.member) : null;
+      const resolved = this.roles && uid ? this.roles.viewOf(uid) : null;
       const allowed = this.personas ? this.personas.allowedFor(resolved, admin) : [];
       if (!allowed.includes(as)) {
         const hint = allowed.length ? `You may post as: ${allowed.join(', ')}.` : 'You have no personas.';
@@ -480,34 +486,16 @@ export class DiscordSide {
     else console.warn(`[discord] ${r.why}; commands are allowed anywhere`);
   }
 
-  // Roles that ship in an update and have never existed in this guild.
-  //
-  // The owner's requirement is that the bot creates the roles itself. That
-  // held for the first run and nowhere after it: adding a trait to the
-  // defaults left an admin to somehow know that /openzone roles sync now
-  // wants running, and until he did, the game would ask about a role nobody
-  // could hold.
-  //
-  // NARROW ON PURPOSE. This runs only when something has never been wired at
-  // all, and sync() itself refuses to resurrect a role marked Missing -- so
-  // a role the admin deleted stays deleted, every time. Nothing happens on a
-  // normal restart, which is why it is safe to have it on a normal restart.
+  // The guild's roles follow the tables only while the roles mirror is on,
+  // and at start-up no server has said so yet -- so this is a no-op on a
+  // plain restart and a full warm when a server reports the kind before the
+  // ready event is over. drain() warms again when the kind comes on later.
   async #syncNewRoles() {
-    if (!this.roles) return;
-    if (this.roles.pending() === 0) return;
-
+    if (!this.rolesMirror) return;
     try {
-      // FETCH first. roles.cache is filled by GUILD_CREATE and can still be
-      // empty here, and an empty cache reads as "no role by that name" --
-      // which would create a duplicate of a role that already exists.
-      await this.guild.roles.fetch();
-
-      const r = await this.roles.sync(this.guild);
-      if (r.made.length) console.log(`[discord] new roles created: ${r.made.join(', ')}`);
-      if (r.adopted.length) console.log(`[discord] adopted existing roles: ${r.adopted.join(', ')}`);
-      if (r.ambiguous.length) console.warn(`[discord] left alone, ambiguous: ${r.ambiguous.join('; ')}`);
+      await this.rolesMirror.warm(this.guild);
     } catch (e) {
-      console.warn(`[discord] could not create the new roles (${e.message}); run /openzone roles sync when it is fixed`);
+      console.warn(`[discord] could not warm the roles mirror (${e.message})`);
     }
   }
 
@@ -635,6 +623,10 @@ export class DiscordSide {
     this.roles = roles;
   }
 
+  useRolesMirror(mirror) {
+    this.rolesMirror = mirror;
+  }
+
   usePersonas(personas) {
     this.personas = personas;
   }
@@ -689,29 +681,9 @@ export class DiscordSide {
       });
       console.log(`[discord] linked ${r.steamId} to ${i.user.tag}`);
 
-      // A fresh stalker starts as a novice: the first link hands out the
-      // stalker BASE identity (inalienable, worn by everyone) and the lowest
-      // rank -- the rank only when none is held yet, because relinking an
-      // account must never demote anybody (owner's decision 2026-08-30).
-      try {
-        const member = await this.guild.members.fetch(i.user.id);
-        const gain = [];
-
-        const base = this.roles?.base();
-        if (base?.RoleId && !member.roles.cache.has(base.RoleId)) gain.push(base.RoleId);
-
-        const ranks = this.roles?.data?.Ranks || [];
-        const holdsAny = ranks.some((rk) => rk.RoleId && member.roles.cache.has(rk.RoleId));
-        const novice = ranks.find((rk) => rk.Slug === 'stalker-novice');
-        if (!holdsAny && novice?.RoleId) gain.push(novice.RoleId);
-
-        if (gain.length) {
-          await member.roles.add(gain, 'first link: a stalker walks in');
-          console.log(`[discord] ${i.user.tag} starts as a stalker`);
-        }
-      } catch (err) {
-        console.warn(`[discord] could not hand out the starting roles: ${err.message}`);
-      }
+      // The row for a fresh stalker -- and, with the roles mirror on, the
+      // starting roles in the guild -- are made by store.onLink(): one hook
+      // for both doors, this command and the OAuth page.
       return;
     }
 
@@ -776,33 +748,43 @@ export class DiscordSide {
 
     if (group === 'faction') {
       await i.deferReply({ flags: MessageFlags.Ephemeral });
+      // The rows first; the guild follows when the roles mirror is on
+      // (R7.7). Not a single guild write happens here otherwise.
       let r;
       if (sub === 'add') {
-        r = await this.roles.addFaction(
-          i.guild,
-          (i.options.getString('slug') || '').toLowerCase(),
-          i.options.getString('name'),
-          0,
-          i.options.getBoolean('leader') ?? false,
-        );
+        r = this.roles.upsertFaction({
+          slug: (i.options.getString('slug') || '').toLowerCase(),
+          label: i.options.getString('name'),
+          hasLeader: i.options.getBoolean('leader') ?? false,
+        });
       } else if (sub === 'rank-add') {
-        r = await this.roles.addFactionRank(
-          i.guild,
+        r = this.roles.addFactionRank(
           (i.options.getString('faction') || '').toLowerCase(),
           (i.options.getString('slug') || '').toLowerCase(),
           i.options.getString('name'),
           i.options.getInteger('order'),
         );
       } else if (sub === 'rank-remove') {
-        r = await this.roles.delFactionRank(
-          i.guild,
+        r = this.roles.delFactionRank(
           (i.options.getString('faction') || '').toLowerCase(),
           (i.options.getString('slug') || '').toLowerCase(),
         );
       } else {
-        r = await this.roles.delFaction(i.guild, (i.options.getString('slug') || '').toLowerCase());
+        r = this.roles.removeFaction((i.options.getString('slug') || '').toLowerCase());
       }
-      await i.editReply({ content: r.ok ? 'Done. The game picks it up within seconds.' : ('No: ' + r.why) });
+      if (r.ok && this.rolesMirror) {
+        try {
+          await this.rolesMirror.afterCatalog(i.guild, r, 'faction ' + sub + ' from Discord');
+        } catch (e) {
+          console.warn(`[roles] mirror did not follow /openzone faction ${sub}: ${e.message}`);
+        }
+      }
+      let said = 'No: ' + r.why;
+      if (r.ok) {
+        said = 'Done. The game picks it up within seconds.';
+        if (!this.rolesMirror || !this.rolesMirror.on()) said += ' (The roles mirror is off, so Discord roles were not touched.)';
+      }
+      await i.editReply({ content: said });
       return;
     }
 
@@ -828,14 +810,22 @@ export class DiscordSide {
       // gives an interaction, so defer first or the reply is refused.
       await i.deferReply({ flags: MessageFlags.Ephemeral });
 
-      const r = await this.roles.sync(i.guild);
+      if (!this.rolesMirror || !this.rolesMirror.on()) {
+        await i.editReply({ content: 'The roles mirror is off: the bot does not touch Discord roles until a server turns it on (VPP > OpenZone > RAW > roles mirror).' });
+        return;
+      }
+
+      const r = await this.rolesMirror.syncCatalog(i.guild);
+      const m = await this.rolesMirror.reconcileAll(i.guild, 'roles sync');
 
       const lines = [];
       if (r.made.length) lines.push('**Created:** ' + r.made.join(', '));
       if (r.adopted.length) lines.push('**Adopted existing:** ' + r.adopted.join(', '));
+      if (r.renamed.length) lines.push('**Renamed back:** ' + r.renamed.join(', '));
       if (r.kept.length) lines.push('**Already wired:** ' + r.kept.length + ' role(s)');
       if (r.ambiguous.length) lines.push('**Ambiguous, left alone:** ' + r.ambiguous.join('; '));
       if (r.failed.length) lines.push('**Failed:** ' + r.failed.join('; '));
+      if (!m.skipped) lines.push(`**Members:** ${m.checked} checked, ${m.fixed} put back, ${m.failed} failed`);
       if (!lines.length) lines.push('Nothing to do.');
 
       await i.editReply({ content: lines.join('\n').slice(0, 1900) });
@@ -846,12 +836,13 @@ export class DiscordSide {
       const lines = [];
       for (const e of this.roles.entries()) {
         let mark = '--';
-        if (e.node.RoleId) mark = '<@&' + e.node.RoleId + '>';
-        if (e.node.Missing) mark = '(deleted in Discord)';
+        if (e.roleId) mark = '<@&' + e.roleId + '>';
+        if (e.missing) mark = '(no Discord role: creation failed)';
 
         let cap = '';
-        if (e.kind === 'faction' && e.node.Limit > 0) {
-          cap = '  ' + this.roles.sizeOf(i.guild, e.slug) + '/' + e.node.Limit;
+        if (e.kind === 'faction') {
+          cap = '  ' + this.roles.sizeOf(e.slug);
+          if (e.limit > 0) cap += '/' + e.limit;
         }
 
         lines.push('`' + e.slug + '` ' + mark + cap);
@@ -900,7 +891,7 @@ export class DiscordSide {
       // Кажемо, скільки ВЖЕ є: ліміт, поставлений нижче за поточний склад,
       // нікого не виганяє -- він лише перекриває набір, -- і адмін мусить
       // побачити це одразу, а не з'ясовувати з чужих скарг.
-      const now = this.roles.sizeOf(i.guild, slug);
+      const now = this.roles.sizeOf(slug);
 
       let said = `\`${slug}\`: no limit`;
       if (r.limit > 0) said = `\`${slug}\`: at most ${r.limit} (currently ${now})`;
@@ -914,9 +905,17 @@ export class DiscordSide {
 
     if (group === 'roles' && sub === 'rename') {
       await i.deferReply({ flags: MessageFlags.Ephemeral });
-      const r = await this.roles.rename(i.guild, i.options.getString('slug'), i.options.getString('name'));
-      if (r.ok) await i.editReply({ content: `Renamed \`${i.options.getString('slug')}\`: **${r.was}** -> **${r.now}**` });
-      else await i.editReply({ content: r.why });
+      const r = this.roles.rename(i.options.getString('slug'), i.options.getString('name'));
+      if (!r.ok) {
+        await i.editReply({ content: r.why });
+        return;
+      }
+      let tail = '';
+      if (this.rolesMirror) {
+        const m = await this.rolesMirror.renameRole(i.guild, r.roleId, r.now);
+        if (!m.ok) tail = ` (the Discord role kept its name: ${m.why})`;
+      }
+      await i.editReply({ content: `Renamed \`${i.options.getString('slug')}\`: **${r.was}** -> **${r.now}**${tail}` });
       return;
     }
 
