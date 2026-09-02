@@ -741,7 +741,7 @@ const routes = {
   // leadership lives in the guild's roles. A server trusted about the second
   // would let a compromised console speak as anyone.
   '/v1/news/post': async ({ Json }) => {
-    const { Uid: uid, Who: asName, Title: title, Body: body } = Json;
+    const { Uid: uid, Who: asName, Title: title, Body: body } = Json || {};
 
     if (!title || !String(title).trim()) return { Error: 'no_title' };
     if (!body || !String(body).trim()) return { Error: 'no_body' };
