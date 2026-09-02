@@ -17,6 +17,7 @@ import { join, dirname } from 'node:path';
 import 'dotenv/config';
 import { byteClip } from './clip.js';
 import { Store } from './store.js';
+import { openPage, olderFromStore, toLine } from './history.js';
 import { DiscordSide } from './discord.js';
 import { HttpSide } from './http.js';
 import { OAuthSide } from './oauth.js';
@@ -39,27 +40,6 @@ function parseAt(at) {
   return Number.isFinite(t) ? t : 0;
 }
 
-// One 8-hour page of a message list, ending at `endMs` -- or, when that
-// window is empty, at the newest message before it, so a quiet stretch
-// falls through to the last page that HAS something.
-function windowSlice(list, endMs) {
-  const windowMs = 8 * 3600 * 1000;
-  if (!list.length) return [];
-
-  let end = endMs;
-  const inWindow = (m) => {
-    const t = parseAt(m.at);
-    return t <= end && t > end - windowMs;
-  };
-
-  if (!list.some(inWindow)) {
-    const newestBefore = [...list].reverse().find((m) => parseAt(m.at) <= end);
-    if (!newestBefore) return [];
-    end = parseAt(newestBefore.at);
-  }
-
-  return list.filter(inWindow);
-}
 
 function need(name) {
   const v = process.env[name];
@@ -213,7 +193,10 @@ function queuePush(uid, line, kind = 'chat') {
 }
 const stampNow = () => new Date().toISOString().replace('T', ' ').slice(0, 19);
 
-const MARK_TTL_MS = 5 * 60 * 1000;
+// How long a shared map mark lives in a conversation before the sweep
+// deletes it (TZ-4 R-D6.1). A setting, not a constant: MARK_TTL_SECONDS in
+// .env, 5 minutes when unset.
+const MARK_TTL_MS = Math.max(30, Number(process.env.MARK_TTL_SECONDS) || 300) * 1000;
 const markStale = (m) => typeof m.text === 'string' && m.text.startsWith('[MARK] ')
   && parseAt(m.at) > 0 && parseAt(m.at) < Date.now() - MARK_TTL_MS;
 
@@ -316,15 +299,21 @@ const routes = {
     if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
     const until = untilRaw ? parseAt(untilRaw) : 0;
 
-    // The default view is ONE 8-HOUR WINDOW, anchored to the conversation
-    // itself: the window ends at NOW when the talk is live, otherwise at the
-    // NEWEST message -- a quiet conversation still opens on its last page
-    // instead of an empty one. Everything older loads page by page through
-    // /older, each page one more 8-hour window.
-    let all = store.messagesOf(key, 1000);
-    if (until) all = all.filter((m) => parseAt(m.at) <= until);
-    const shown = windowSlice(all, until || Date.now());
-    const trimmed = all.length - shown.length;
+    // A PAGE IS A COUNT OF LINES (TZ-4 R-D2.1): the newest ChatHistoryOpen
+    // of them, and "more" is what the store knows, not a guess about a full
+    // tail. When the store's whole tail fits on this page, Discord is asked
+    // once whether anything lies deeper -- that is the only way the flag
+    // stays a fact for a conversation older than our memory (R-D2.4).
+    const page = openPage({ store, key, uid, limit, until, parseAt });
+    let more = page.more;
+    if (!more && c.threadId) {
+      try {
+        more = await discord.hasOlder(c.threadId, page.oldest);
+      } catch (err) {
+        console.warn(`[chat] hasOlder failed: ${err.message}`);
+      }
+    }
+    const shown = page.lines;
 
     return {
       Id: key,
@@ -334,19 +323,11 @@ const routes = {
       // GAME names first: the Zone knows one identity, and the Discord nick
       // is not it. The nick only fills in for people the game never saw.
       Members: c.kind === 'zone' ? [] : c.members.map((m) => store.nameOf(m) || store.linkOf(m)?.discordName || m),
-      // Older exists if we trimmed anything here, or the store tail is at its
-      // cap (the thread very likely goes further back than we remember).
-      More: trimmed > 0 || all.length >= 100,
-      Before: shown[0]?.id || '',
+      More: more,
+      Before: page.before,
       Owner: key.startsWith(`g:${uid}:`),
       Frozen: !!until || (c.kind === 'direct' && !!c.pairFrozen),
-      Lines: shown.map((m) => ({
-        At: m.at,
-        Who: m.who,
-        Text: m.text,
-        Mine: m.uid === uid,
-        AUid: m.uid || '',
-      })),
+      Lines: shown,
     };
   },
 
@@ -359,29 +340,37 @@ const routes = {
     if (!c || !Store.memberOf(c, uid)) return { Error: 'no_chat' };
     const until = untilRaw ? parseAt(untilRaw) : 0;
 
-    const page = Math.min(limit || 50, 100);
+    const page = Math.min(Math.max(Number(limit) || 20, 1), 100);
 
-    // 1) the store tail first: the previous 8-hour window, anchored to the
-    // newest message OLDER than the current top -- a week-long silence is
-    // skipped in one step instead of seven empty pages.
-    let all = store.messagesOf(key, 1000);
-    if (until) all = all.filter((m) => parseAt(m.at) <= until);
-    let at = before ? all.findIndex((m) => m.id === before) : -1;
-    if (at > 0) {
-      const older = all.slice(0, at);
-      const chunk = windowSlice(older, parseAt(older[older.length - 1].at) + 1);
+    // 1) the store first: the page of lines before the current top
+    // (TZ-4 R-D2.2). Whether more exist is read, not guessed; at the
+    // store's edge Discord is asked, because it alone remembers deeper.
+    const fromStore = olderFromStore({ store, key, uid, before, limit: page, until, parseAt });
+    if (fromStore) {
+      let more = fromStore.more;
+      if (!more && fromStore.atStoreEdge && c.threadId) {
+        try {
+          more = await discord.hasOlder(c.threadId, fromStore.oldest);
+        } catch (err) {
+          console.warn(`[chat] hasOlder failed: ${err.message}`);
+        }
+      }
       return {
         Id: key,
-        More: older.length - chunk.length > 0 || !!c.threadId,
-        Before: chunk[0]?.id || before,
-        Lines: chunk.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: m.uid === uid, AUid: m.uid || '' })),
+        More: more,
+        Before: fromStore.before,
+        Lines: fromStore.lines,
       };
     }
 
     // 2) the thread itself
     if (!c.threadId) return { Id: key, More: false, Before: before || '', Lines: [] };
     try {
-      let lines = await discord.fetchOlder(c.threadId, before, page);
+      // One more than the page: the extra line, if it exists, is the fact
+      // behind "more" (R-D2.4) and is not shown.
+      let lines = await discord.fetchOlder(c.threadId, before, page + 1);
+      const deeper = lines.length > page;
+      if (deeper) lines = lines.slice(lines.length - page);
 
       // The store still knows the author of anything inside its tail, and
       // the Discord page overlaps the tail at its edge. Filling those in
@@ -411,9 +400,9 @@ const routes = {
       // where the answer is actually knowable.
       return {
         Id: key,
-        More: lines.length === page,
+        More: deeper,
         Before: lines[0]?.id || before || '',
-        Lines: lines.map((m) => ({ At: m.at, Who: m.who, Text: m.text, Mine: !!m.uid && m.uid === uid, AUid: m.uid || '' })),
+        Lines: lines.map((m) => toLine(m, uid)),
       };
     } catch (err) {
       console.warn(`[chat] older fetch failed: ${err.message}`);

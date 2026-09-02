@@ -1227,6 +1227,15 @@ export class DiscordSide {
     await th.setLocked(locked);
   }
 
+  // Is there anything in the thread before this message? One line's worth
+  // of a fetch: the fact behind the "load older" button (TZ-4 R-D2.4).
+  async hasOlder(threadId, beforeId) {
+    if (!beforeId) return false;
+    const th = await this.client.channels.fetch(threadId);
+    const batch = await th.messages.fetch({ limit: 1, before: beforeId });
+    return batch.size > 0;
+  }
+
   async fetchOlder(threadId, beforeId, limit) {
     const th = await this.client.channels.fetch(threadId);
     const opts = { limit: Math.min(limit || 50, 100) };
