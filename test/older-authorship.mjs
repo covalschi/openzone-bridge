@@ -10,7 +10,7 @@
 
 import { Store } from '../src/store.js';
 
-const store = new Store(process.env.BRIDGE_STATE || './state/bridge.json');
+const store = new Store(process.env.BRIDGE_DB || './state/bridge.sqlite');
 
 let pass = 0;
 let fail = 0;

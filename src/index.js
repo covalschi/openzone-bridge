@@ -1,3 +1,5 @@
+import { existsSync } from 'node:fs';
+import { join, dirname } from 'node:path';
 // OpenZone Bridge.
 //
 // DISCORD IS THE SOURCE OF TRUTH. The game does not keep conversations; it
@@ -79,13 +81,30 @@ const cfg = {
   secret: need('OZ_SHARED_SECRET'),
   // Under ten: see the note in http.js -- the game's request dies at 10 s.
   holdSeconds: Number(process.env.POLL_HOLD_SECONDS || 8),
+  // The old JSON document; read only to notice it has not been migrated.
   statePath: process.env.BRIDGE_STATE || './state/bridge.json',
+  // The store (TZ-2 R6.1). Path from .env, never logged (R6.3).
+  dbPath: process.env.BRIDGE_DB || './state/bridge.sqlite',
   // Optional: a Discord role that counts as bridge admin alongside the
   // Administrator permission (personas, /openzone).
   adminRoleId: process.env.DISCORD_ADMIN_ROLE_ID || '',
 };
 
-const store = new Store(cfg.statePath);
+const store = new Store(cfg.dbPath);
+
+// AN UNMIGRATED DOCUMENT BESIDE AN EMPTY DATABASE IS A STOP, NOT A START.
+//
+// TZ-2 R6.2 forbids migrating silently at start; starting empty would be the
+// other silent thing -- every link and every conversation key gone from the
+// bot's memory while the document that holds them sits a directory away.
+// So: say it, name the command, and exit. BRIDGE_DB_FRESH=1 is the explicit
+// "I mean it" for a host that truly starts over.
+if (existsSync(cfg.statePath) && store.isEmpty() && !process.env.BRIDGE_DB_FRESH) {
+  console.error('[store] the database is empty but an old state document exists beside it.');
+  console.error('[store] migrate first:  node scripts/migrate-json-to-sqlite.mjs');
+  console.error('[store] or, to really start over, set BRIDGE_DB_FRESH=1.');
+  process.exit(3);
+}
 
 // OUR OWN ID FOR A RECORD, and it is deliberately not Discord's (TZ-2 R6.4).
 //
@@ -128,7 +147,7 @@ discord.useCodes(codes);
 // The roster lives in its own file, not in the bridge state: store.save()
 // rewrites the whole state document on every single chat message, and role
 // ids have no business riding that.
-const roles = new Roles(cfg.statePath.replace(/[^\\/]+$/, 'roles.json'));
+const roles = new Roles(join(dirname(cfg.dbPath), 'roles.json'));
 discord.useRoles(roles);
 const personas = new Personas('./state/personas.json');
 discord.usePersonas(personas);
@@ -231,7 +250,8 @@ setInterval(() => sweepMarks().catch((e) => console.warn(`[marks] sweep: ${e.mes
 
 async function pairFreeze(a, b, frozen) {
   if (!a || !b) return { Error: 'no_chat' };
-  for (const [key, c] of Object.entries(store.data.convos)) {
+  for (const c of store.convosAll()) {
+    const key = c.key;
     if (c.kind !== 'direct') continue;
     if (!c.members.includes(a) || !c.members.includes(b)) continue;
 
@@ -466,10 +486,8 @@ const routes = {
     // key forever (owner's decision 2026-08-29).
     if (!key.startsWith(`g:${uid}:`)) return { Error: 'not_owner' };
 
-    store.dropInvitesOf(key);
-    delete store.data.convos[key];
-    delete store.data.messages[key];
-    store.save();
+    // The conversation, its invites and every line in it -- one transaction.
+    store.dropConvo(key);
 
     if (c.threadId) {
       try {
@@ -525,7 +543,7 @@ const routes = {
       try {
         await discord.say(c.threadId, npcName || npcId, byteClip(text), null);
       } catch (err) {
-        if (line) line.inDiscord = false;
+        if (line) store.setInDiscord(key, line.id, false);
         console.warn(`[npc] stored but not mirrored: ${err.message}`);
       }
     }
@@ -674,7 +692,7 @@ const routes = {
         // The guild refused, so the line is NOT there -- say so in the
         // record, or the store would later drop it believing Discord has a
         // copy that does not exist.
-        if (stored) stored.inDiscord = false;
+        if (stored) store.setInDiscord(key, stored.id, false);
         console.warn(`[chat] stored but not mirrored: ${err.message}`);
       }
     }

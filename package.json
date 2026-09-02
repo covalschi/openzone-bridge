@@ -10,7 +10,7 @@
     "check": "node --check src/index.js && node --check src/discord.js && node --check src/store.js && node --check src/http.js && node --check src/oauth.js"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "dependencies": {
     "discord.js": "^14.16.3",

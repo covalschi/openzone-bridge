@@ -13,13 +13,13 @@ Set-Location $PSScriptRoot
 
 $node = Get-Command node -ErrorAction SilentlyContinue
 if (-not $node) {
-    Write-Error 'node not found. Install Node.js 20 or newer.'
+    Write-Error 'node not found. Install Node.js 24 or newer.'
     exit 1
 }
 
 $major = [int](node -p 'process.versions.node.split(".")[0]')
-if ($major -lt 20) {
-    Write-Error "Node $(node -v) is too old: the bridge needs 20+ (package.json engines)."
+if ($major -lt 24) {
+    Write-Error "Node $(node -v) is too old: the bridge needs 24+ (node:sqlite ships unflagged from 24; package.json engines)."
     exit 1
 }
 
@@ -36,12 +36,12 @@ if (-not (Test-Path node_modules)) {
 
 if ($Loop) {
     while ($true) {
-        node src/index.js
+        node --disable-warning=ExperimentalWarning src/index.js
         if ($LASTEXITCODE -eq 0) { break }
         Write-Host "Bridge exited with $LASTEXITCODE. Restarting in 5 s (Ctrl+C to stop)..."
         Start-Sleep -Seconds 5
     }
 } else {
-    node src/index.js
+    node --disable-warning=ExperimentalWarning src/index.js
     exit $LASTEXITCODE
 }

@@ -12,13 +12,13 @@ set -euo pipefail
 cd "$(dirname "$0")"
 
 if ! command -v node > /dev/null; then
-    echo "node not found. Install Node.js 20 or newer." >&2
+    echo "node not found. Install Node.js 24 or newer." >&2
     exit 1
 fi
 
 major="$(node -p 'process.versions.node.split(".")[0]')"
-if [ "$major" -lt 20 ]; then
-    echo "Node $(node -v) is too old: the bridge needs 20+ (package.json engines)." >&2
+if [ "$major" -lt 24 ]; then
+    echo "Node $(node -v) is too old: the bridge needs 24+ (node:sqlite ships unflagged from 24; package.json engines)." >&2
     exit 1
 fi
 
@@ -34,10 +34,10 @@ fi
 
 if [ "${1:-}" = "--loop" ]; then
     while true; do
-        node src/index.js && break
+        node --disable-warning=ExperimentalWarning src/index.js && break
         echo "Bridge exited with $?. Restarting in 5 s (Ctrl+C to stop)..."
         sleep 5
     done
 else
-    exec node src/index.js
+    exec node --disable-warning=ExperimentalWarning src/index.js
 fi

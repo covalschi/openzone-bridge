@@ -149,6 +149,19 @@ to.
 
 ---
 
+## 7. Where the bridge keeps its memory
+
+One SQLite file, `state/bridge.sqlite` by default (`BRIDGE_DB` in `.env`). It holds every
+account link and every conversation key: lose it and no message is lost, but every
+conversation becomes unreachable, so back it up like a database. A bridge upgraded from
+the old `state/bridge.json` migrates by hand, once:
+
+```
+node scripts/migrate-json-to-sqlite.mjs
+```
+
+The report names what was copied; the JSON document is left in place for you to move aside.
+
 ## What to hand over
 
 Only the two public ids are worth passing to anyone helping you:

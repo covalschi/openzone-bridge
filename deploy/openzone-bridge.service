@@ -22,7 +22,7 @@ Wants=network-online.target
 Type=simple
 User=openzone
 WorkingDirectory=/opt/openzone-bridge
-ExecStart=/usr/bin/node src/index.js
+ExecStart=/usr/bin/node --disable-warning=ExperimentalWarning src/index.js
 Restart=always
 RestartSec=5
 

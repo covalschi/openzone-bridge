@@ -32,13 +32,34 @@ The bridge closes that gap:
 
 ## Running
 
-Node.js **20+** and a filled-in `.env` (see `SETUP.md`). Then:
+Node.js **24+** (the store is `node:sqlite`, which ships unflagged from 24 -- nothing to
+compile on the host) and a filled-in `.env` (see `SETUP.md`). Then:
 
 - **Windows**: `.\run.ps1` — or `.\run.ps1 -Loop` to restart on crash.
 - **Linux**: `./run.sh` — or `./run.sh --loop`.
 
 Both scripts check the Node version, install the two dependencies on first
 run, refuse to start without `.env`, and then just run `node src/index.js`.
+
+## State
+
+Everything the bridge remembers -- account links, conversation keys, the chat
+tail, news, invites -- lives in one SQLite file, `state/bridge.sqlite` by
+default (`BRIDGE_DB` in `.env`). Writes are atomic and the chat tail is read
+from a cursor, not by loading the whole file; a line that exists only here is
+never evicted.
+
+Upgrading from a bridge that kept `state/bridge.json`: the bot does **not**
+migrate on its own. Run
+
+```
+node scripts/migrate-json-to-sqlite.mjs
+```
+
+once, read the report, and only then start the bridge; it refuses to start
+beside an unmigrated document. Back up `state/` the way you would any small
+database -- copy the `.sqlite` file while the bridge is stopped, or use
+`sqlite3 state/bridge.sqlite ".backup state/bridge.bak"` while it runs.
 
 For unattended hosting:
 
