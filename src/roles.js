@@ -734,7 +734,7 @@ export class Roles {
   // The actor's authority is checked HERE TOO, not only in the game. The game
   // is trusted (it holds the shared secret) but "trusted" and "the only thing
   // standing between a player and a role" are different jobs.
-  async apply(guild, actor, target, op, arg) {
+  async apply(guild, actor, target, op, arg, max = 0) {
     const idOf = (e) => (e && e.node && !e.node.Missing ? e.node.RoleId : null);
 
     const held = (member, id) => id && member.roles.cache.has(id);
@@ -826,7 +826,14 @@ export class Roles {
         // ЛІМІТ. Перевіряється ТУТ, у єдиному місці, де хтось вступає у
         // фракцію з гри -- і саме тому він не заважає адмінові видати роль у
         // Discord вручну. Discord головний; ліміт керує НАБОРОМ, а не складом.
-        const cap = e.node.Limit || 0;
+        //
+        // І ЦЕ ЄДИНА СТЕЛЯ (ТЗ-4 R-C3.2). Гра свого лічильника більше не має:
+        // він рахував проекції, які живуть лише поки гравець у Зоні, тобто
+        // присутніх, а два лічильники за різними правилами неминуче
+        // розходились. sizeOf() рахує КОЖНОГО, хто носить роль, офлайнових
+        // теж (R-C3.1). `max` -- те, що каже Factions.json гри (MaxMembers):
+        // береться лише коли в реєстрі бота немає власного Limit.
+        const cap = e.node.Limit || max || 0;
         if (cap > 0) {
           const now = this.sizeOf(guild, e.node.Slug);
           if (now >= cap) return { ok: false, why: `${e.node.Label} is full (${now}/${cap})` };

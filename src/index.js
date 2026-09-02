@@ -751,8 +751,8 @@ const routes = {
   // Permadeath: the game asks, the bridge executes its half. Faction
   // lifecycle deliberately has NO route -- factions are born and die only
   // through the bot commands (owner's decision 2026-08-30).
-  '/v1/player/wipe': async ({ Json }) => {
-    const r = await wipePlayer(Json.Uid);
+  '/v1/player/wipe': async ({ Json, ServerId }) => {
+    const r = await wipePlayer(Json.Uid, ServerId);
 
     // WHO STARTED IT decides who still has work to do. From the game's own
     // admin console (FromGame) the game has already frozen the character
@@ -898,6 +898,23 @@ const routes = {
   // thing between a player and a role. Admin is the exception: whether a
   // SteamID is a server admin is knowledge only the game has, so that claim
   // is taken on the secret alone.
+  // Every linked player's projection, present in the Zone or not (TZ-4
+  // R-C4.2). The game's own admin roster used to list only who was online,
+  // because the projections it keeps live only while a player is connected
+  // -- so an offline player could be neither wiped nor assigned. The bot's
+  // base is the one place that knows everybody. The game adds the online
+  // players the bot has never heard of (not linked) itself.
+  '/v1/roles/roster': async () => {
+    if (!discord.guild) return { Ok: false, Why: 'the bot is not connected', Rows: [] };
+
+    const rows = [];
+    for (const l of store.linksAll()) {
+      const v = rolesFor(l.steamId);
+      if (v) rows.push({ Uid: l.steamId, ...v });
+    }
+    return { Ok: true, Why: '', Rows: rows };
+  },
+
   '/v1/roles/apply': async ({ Json }) => {
     if (!discord.guild) return { Ok: false, Why: 'the bot is not connected' };
 
@@ -921,7 +938,7 @@ const routes = {
       if (!gate.ok) return { Ok: false, Why: gate.why };
     }
 
-    const r = await roles.apply(discord.guild, actor, target, Json.Op, Json.Arg);
+    const r = await roles.apply(discord.guild, actor, target, Json.Op, Json.Arg, Number(Json.Max) || 0);
     if (!r.ok) return { Ok: false, Why: r.why };
 
     console.log(`[roles] ${Json.Admin ? 'admin' : Json.ActorUid} ${Json.Op} ${Json.Arg || ''} -> ${Json.TargetUid}`);
@@ -1016,6 +1033,15 @@ function mirrored(serverId, kind) {
   const list = mirrors.get(serverId);
   if (!list) return false;
   return list.has(kind);
+}
+
+// The same question with no server to ask it for -- a wipe started by the
+// bot command. Any server that mirrors the kind makes the answer yes.
+function anyMirrored(kind) {
+  for (const list of mirrors.values()) {
+    if (list.has(kind)) return true;
+  }
+  return false;
 }
 
 function drain({ ServerId, Cursor, Uids, Fresh, Mirrors }) {
@@ -1164,11 +1190,18 @@ function drain({ ServerId, Cursor, Uids, Fresh, Mirrors }) {
 // His next character is a different person: the game addresses contacts by
 // character key, so a new life starts unknown to everyone and its threads
 // are new threads.
-async function wipePlayer(uid) {
+async function wipePlayer(uid, serverId = '') {
   if (!uid) return { ok: false, why: 'no uid' };
 
   const link = store.linkOf(uid);
   const discordId = link?.discordId || '';
+
+  // ARCHIVING IS THE DISCORD SIDE'S BUSINESS (TZ-4 R-D5.3), and only when
+  // chat is mirrored at all: with the mirror off there is nothing in the
+  // guild to archive. The PDA side hears nothing of it (R-D5.1/R-D5.5) --
+  // to the other party the wiped character simply went quiet, exactly like
+  // somebody who stopped playing.
+  const chatMirrored = serverId ? mirrored(serverId, 'chat') : anyMirrored('chat');
 
   // З приватних тредiв -- геть, але самi треди лишаються жити.
   for (const key of store.allConvoKeys()) {
@@ -1190,6 +1223,17 @@ async function wipePlayer(uid) {
     // запросив би той самий акаунт назад.
     c.members = c.members.filter((m) => m !== uid);
     store.putConvo(key, c);
+
+    // A private thread of a dead character is over: locked and archived in
+    // the guild. Groups are NOT archived -- for the others this is an
+    // ordinary member leaving (R-D5.4), and the group goes on without him.
+    if (c.kind === 'direct' && chatMirrored && c.threadId) {
+      try {
+        await discord.archiveThread(c.threadId, 'OpenZone: permadeath');
+      } catch {
+        // The thread may already be gone; the store above is what matters.
+      }
+    }
   }
 
   // Ролi: усе геть, новачок назад -- нове життя починається з нуля.

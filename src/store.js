@@ -143,6 +143,7 @@ export class Store {
                  'ON CONFLICT(steam_id) DO UPDATE SET discord_id = excluded.discord_id, discord_name = excluded.discord_name, linked_at = excluded.linked_at'),
       linkGet: q('SELECT discord_id, discord_name, linked_at FROM links WHERE steam_id = ?'),
       linkByDiscord: q('SELECT steam_id FROM links WHERE discord_id = ? ORDER BY linked_at DESC LIMIT 1'),
+      linkAll: q('SELECT steam_id, discord_id FROM links ORDER BY linked_at'),
 
       nameSet: q('INSERT INTO names(steam_id, name) VALUES (?, ?) ON CONFLICT(steam_id) DO UPDATE SET name = excluded.name'),
       nameGet: q('SELECT name FROM names WHERE steam_id = ?'),
@@ -229,6 +230,12 @@ export class Store {
   steamIdOf(discordId) {
     const row = this.q.linkByDiscord.get(discordId);
     return row ? row.steam_id : null;
+  }
+
+  // Everybody who ever linked, oldest first. The admin roster is built from
+  // this (TZ-4 R-C4.2): the game itself only knows who is in the Zone.
+  linksAll() {
+    return this.q.linkAll.all().map((row) => ({ steamId: row.steam_id, discordId: row.discord_id }));
   }
 
   // ---- game names ----
