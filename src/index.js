@@ -18,6 +18,7 @@ import 'dotenv/config';
 import { byteClip } from './clip.js';
 import { Store } from './store.js';
 import { openPage, olderFromStore, toLine } from './history.js';
+import { fillMirror } from './mirror.js';
 import { DiscordSide } from './discord.js';
 import { HttpSide } from './http.js';
 import { OAuthSide } from './oauth.js';
@@ -904,6 +905,15 @@ const routes = {
   // -- so an offline player could be neither wiped nor assigned. The bot's
   // base is the one place that knows everybody. The game adds the online
   // players the bot has never heard of (not linked) itself.
+  // Turning a mirror on from the game's admin console (TZ-2 R5.2): push the
+  // history of the kind from the base into the guild, report counts, and
+  // only then does the game write Mirror: true. Idempotent -- see mirror.js.
+  '/v1/mirror/fill': async ({ Json }) => {
+    if (!discord.guild) return { Ok: false, Why: 'the bot is not connected', Pushed: 0, Skipped: 0, Failed: 0, Note: '' };
+    const r = await fillMirror({ store, discord, kind: String(Json.Kind || '') });
+    return { Ok: r.ok, Why: r.why, Pushed: r.pushed, Skipped: r.skipped, Failed: r.failed, Note: r.note };
+  },
+
   '/v1/roles/roster': async () => {
     if (!discord.guild) return { Ok: false, Why: 'the bot is not connected', Rows: [] };
 
