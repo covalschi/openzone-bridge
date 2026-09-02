@@ -231,6 +231,16 @@ async function sweepMarks() {
 }
 setInterval(() => sweepMarks().catch((e) => console.warn(`[marks] sweep: ${e.message}`)), 30000);
 
+// Invites past their lifetime go the same way marks do (TZ-4 R-D3.3).
+setInterval(() => {
+  try {
+    const gone = store.sweepInvites();
+    if (gone > 0) console.log(`[chat] ${gone} expired invite(s) swept`);
+  } catch (e) {
+    console.warn(`[chat] invite sweep: ${e.message}`);
+  }
+}, 60000);
+
 async function pairFreeze(a, b, frozen) {
   if (!a || !b) return { Error: 'no_chat' };
   for (const c of store.convosAll()) {
@@ -485,14 +495,20 @@ const routes = {
     // key forever (owner's decision 2026-08-29).
     if (!key.startsWith(`g:${uid}:`)) return { Error: 'not_owner' };
 
-    // The conversation, its invites and every line in it -- one transaction.
-    store.dropConvo(key);
+    // ARCHIVED, NOT DESTROYED (TZ-4 R-D4.2). Deleting used to take the
+    // thread and every member's copy of the talk with it. Now the group
+    // simply has nobody in it: it leaves every list, its lines stay home,
+    // its invites go, and the Discord thread is locked and archived.
+    c.archived = true;
+    c.members = [];
+    store.putConvo(key, c);
+    store.dropInvitesOf(key);
 
     if (c.threadId) {
       try {
-        await discord.deleteThread(c.threadId, `group deleted by ${uid}`);
+        await discord.archiveThread(c.threadId, `group deleted by ${uid}`);
       } catch (err) {
-        console.warn(`[chat] group thread delete failed: ${err.message}`);
+        console.warn(`[chat] group thread archive failed: ${err.message}`);
       }
     }
     return { ok: true };
@@ -566,15 +582,26 @@ const routes = {
 
     // The ceiling comes from the game's Tuning.json with every invite; the
     // bridge only holds the roster. Zero (or absent) means no ceiling.
-    if (Number.isInteger(max) && max > 0 && c.members.length >= max) {
+    // SEATS PROMISED COUNT (TZ-4 R-D3.1): members plus the invites still
+    // standing, or a full group could be over-invited and the last ones to
+    // click would find no room.
+    const ceiling = Number.isInteger(max) ? max : 0;
+    if (ceiling > 0 && c.members.length + store.inviteCount(key) >= ceiling) {
       return { Error: 'group_full' };
+    }
+    // Remembered on the conversation so the check can be repeated when the
+    // invite is accepted (R-D3.2): the roster may have changed in between.
+    if (ceiling !== (c.max || 0)) {
+      c.max = ceiling;
+      store.putConvo(key, c);
     }
 
     // Nobody lands in a group unasked (owner's decision 2026-08-29): the
     // add files an INVITE, membership waits for the invitee's own click.
     // The toast rides the ordinary chat-push pipe -- the HUD already knows
-    // how to ring about a line.
-    store.addInvite(key, otherUid, uid);
+    // how to ring about a line. The invite lives TtlS seconds (R-D3.3), a
+    // number the game takes from its tuning; zero keeps it forever.
+    store.addInvite(key, otherUid, uid, Number(Json.TtlS) || 0);
     queuePush(otherUid, {
       Uid: otherUid,
       Id: '',
@@ -590,8 +617,18 @@ const routes = {
     const { Uid: uid, Id: key } = Json;
     if (!store.hasInvite(key, uid)) return { Error: 'no_chat' };
     const c = store.convo(key);
+    if (!c) {
+      store.dropInvite(key, uid);
+      return { Error: 'no_chat' };
+    }
+
+    // CHECKED AGAIN AT ACCEPTANCE (TZ-4 R-D3.2): the roster may have filled
+    // up since the invite was written. The invite stays, so a seat that
+    // frees up later can still be taken.
+    if ((c.max || 0) > 0 && !c.members.includes(uid) && c.members.length >= c.max) {
+      return { Error: 'group_full' };
+    }
     store.dropInvite(key, uid);
-    if (!c) return { Error: 'no_chat' };
 
     if (!c.members.includes(uid)) {
       c.members.push(uid);
@@ -617,6 +654,18 @@ const routes = {
 
     c.members = c.members.filter((m) => m !== uid);
     store.putConvo(key, c);
+
+    // Out of the game's group means out of its thread (TZ-4 R-D4.1). A
+    // failure here is logged, not fatal: the roster is already right, and
+    // the next ensureThread would not re-add a non-member anyway.
+    const left = store.linkOf(uid);
+    if (c.threadId && left) {
+      try {
+        await discord.removeFromThread(c.threadId, left.discordId);
+      } catch (err) {
+        console.warn(`[chat] could not remove ${uid} from the thread: ${err.message}`);
+      }
+    }
     return { ok: true };
   },
 

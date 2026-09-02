@@ -99,6 +99,7 @@ export class Store {
     this.db.exec('PRAGMA synchronous = FULL');
     this.db.exec('PRAGMA foreign_keys = ON');
     for (const ddl of SCHEMA) this.db.exec(ddl);
+    this.#upgrade();
 
     this.#prepare();
 
@@ -116,6 +117,17 @@ export class Store {
   saveSoon() {}
 
   // ---- plumbing ----
+
+  // Columns added after the first schema. CREATE TABLE IF NOT EXISTS leaves
+  // an existing table alone, so a new column has to be asked for by name.
+  #upgrade() {
+    const cols = this.db.prepare('PRAGMA table_info(invites)').all().map((c) => c.name);
+    if (!cols.includes('expires_at')) {
+      // TZ-4 R-D3.3: a group invite has a lifetime. Empty means "never
+      // expires" -- every invite written before this column existed.
+      this.db.exec("ALTER TABLE invites ADD COLUMN expires_at TEXT NOT NULL DEFAULT ''");
+    }
+  }
 
   #prepare() {
     const q = (sql) => this.db.prepare(sql);
@@ -140,11 +152,14 @@ export class Store {
       convoDel: q('DELETE FROM convos WHERE key = ?'),
       convoAll: q('SELECT key, json FROM convos ORDER BY key'),
 
-      invSet: q('INSERT INTO invites(key, uid, from_uid, at) VALUES (?, ?, ?, ?) ' +
-                'ON CONFLICT(key, uid) DO UPDATE SET from_uid = excluded.from_uid, at = excluded.at'),
+      invSet: q('INSERT INTO invites(key, uid, from_uid, at, expires_at) VALUES (?, ?, ?, ?, ?) ' +
+                'ON CONFLICT(key, uid) DO UPDATE SET from_uid = excluded.from_uid, at = excluded.at, expires_at = excluded.expires_at'),
       invDel: q('DELETE FROM invites WHERE key = ? AND uid = ?'),
-      invHas: q('SELECT 1 FROM invites WHERE key = ? AND uid = ?'),
-      invOfUid: q('SELECT key, from_uid FROM invites WHERE uid = ? ORDER BY at'),
+      // "live" = not expired: an empty expiry never expires.
+      invHas: q("SELECT 1 FROM invites WHERE key = ? AND uid = ? AND (expires_at = '' OR expires_at > ?)"),
+      invOfUid: q("SELECT key, from_uid FROM invites WHERE uid = ? AND (expires_at = '' OR expires_at > ?) ORDER BY at"),
+      invCount: q("SELECT COUNT(*) AS n FROM invites WHERE key = ? AND (expires_at = '' OR expires_at > ?)"),
+      invSweep: q("DELETE FROM invites WHERE expires_at <> '' AND expires_at <= ?"),
       invDelKey: q('DELETE FROM invites WHERE key = ?'),
 
       newsAll: q('SELECT json FROM news ORDER BY ts'),
@@ -288,8 +303,16 @@ export class Store {
 
   // ---- group invites ----
 
-  addInvite(key, uid, from) {
-    this.q.invSet.run(key, uid, from || '', new Date().toISOString());
+  // ttlSeconds > 0 gives the invite a lifetime (TZ-4 R-D3.3); 0 or absent
+  // keeps it until answered, as before.
+  addInvite(key, uid, from, ttlSeconds = 0) {
+    const now = Date.now();
+    // Zero keeps it forever; any other number is a lifetime in seconds, and a
+    // negative one is already over -- which is how a test writes an expired
+    // invite without waiting.
+    const ttl = Number(ttlSeconds) || 0;
+    const expires = ttl !== 0 ? new Date(now + ttl * 1000).toISOString() : '';
+    this.q.invSet.run(key, uid, from || '', new Date(now).toISOString(), expires);
   }
 
   dropInvite(key, uid) {
@@ -297,11 +320,22 @@ export class Store {
   }
 
   hasInvite(key, uid) {
-    return !!this.q.invHas.get(key, uid);
+    return !!this.q.invHas.get(key, uid, new Date().toISOString());
   }
 
   invitesOf(uid) {
-    return this.q.invOfUid.all(uid).map((r) => ({ key: r.key, from: r.from_uid }));
+    return this.q.invOfUid.all(uid, new Date().toISOString()).map((r) => ({ key: r.key, from: r.from_uid }));
+  }
+
+  // Live invites standing against a conversation: they count toward the
+  // group ceiling (TZ-4 R-D3.1) - a seat promised is a seat taken.
+  inviteCount(key) {
+    return this.q.invCount.get(key, new Date().toISOString()).n;
+  }
+
+  // Drop every invite past its lifetime. Returns how many went.
+  sweepInvites() {
+    return this.q.invSweep.run(new Date().toISOString()).changes;
   }
 
   dropInvitesOf(key) {

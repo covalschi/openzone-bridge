@@ -1185,6 +1185,23 @@ export class DiscordSide {
     if (th) await th.delete(reason);
   }
 
+  // A deleted group leaves its thread standing as an archive (TZ-4 R-D4.2):
+  // locked so nobody writes into a dead group, archived so it leaves the
+  // active list. Deleting it took every member's copy of the talk away.
+  async archiveThread(threadId, reason) {
+    const th = await this.client.channels.fetch(threadId).catch(() => null);
+    if (!th) return;
+    try { await th.setLocked(true, reason); } catch { /* archived below anyway */ }
+    await th.setArchived(true, reason);
+  }
+
+  // Leaving a group in the game leaves its thread too (TZ-4 R-D4.1).
+  async removeFromThread(threadId, discordId) {
+    if (!discordId) return;
+    const th = await this.client.channels.fetch(threadId).catch(() => null);
+    if (th) await th.members.remove(discordId);
+  }
+
   // Three answers, never conflated -- the same discipline as #lookUp.
   // A note book must NOT be wiped because Discord had a 500: `gone` is only
   // 10003 Unknown Channel / 10004 Unknown/10008 Unknown Message-thread;
