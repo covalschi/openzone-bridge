@@ -229,6 +229,13 @@ console.log('catalog');
   roles.apply('', '500', 'faction.set', 'renegade');
   ok('its first member leads', roles.viewOf('500').Posts, ['leader']);
 
+  r = roles.upsertFaction({ slug: 'renegade', label: 'Ренегати Зони' });
+  ok('renaming the faction renames the leader post named after it', roles.find('renegade:leader').node.label, 'Лідер: Ренегати Зони');
+  roles.rename('renegade:leader', 'Отаман');
+  r = roles.upsertFaction({ slug: 'renegade', label: 'Ренегати Краю' });
+  ok('a hand-named post keeps its name', roles.find('renegade:leader').node.label, 'Отаман');
+  r = roles.rename('renegade', 'Ренегати');
+  ok('rename() of the faction leaves the hand-named post alone too', [r.ok, roles.find('renegade:leader').node.label], [true, 'Отаман']);
   r = roles.upsertFaction({ slug: 'renegade', label: 'Ренегати Зони', limit: 5, hasLeader: false });
   ok('editing: label and limit change, the leader post goes', [r.ok, r.created, roles.find('renegade').node.label, roles.limitOf('renegade'), roles.find('renegade:leader')], [true, false, 'Ренегати Зони', 5, null]);
   ok('and the member lost the post', [roles.viewOf('500').Posts, r.touched], [[], ['500']]);
@@ -274,7 +281,7 @@ console.log('catalog');
 console.log('mirror off');
 {
   const guild = fakeGuild();
-  const off = new RolesMirror(roles, store, { isOn: () => false, log });
+  const off = new RolesMirror(roles, store, { isOn: () => false, log, echoWindowMs: 0 });
   store.link('100', 'd-100', 'one');
   const m = guild.addMember('d-100', ['stray']);
   await off.afterApply(guild, ['100']);
@@ -291,7 +298,7 @@ console.log('mirror on');
 {
   const guild = fakeGuild();
   let on = false;
-  const mirror = new RolesMirror(roles, store, { isOn: () => on, log });
+  const mirror = new RolesMirror(roles, store, { isOn: () => on, log, echoWindowMs: 0 });
   const one = guild.addMember('d-100', ['stray']);
   store.link('200', 'd-200', 'two');
   const two = guild.addMember('d-200', []);
@@ -360,6 +367,21 @@ console.log('mirror on');
   const s2 = await mirror.syncCatalog(guild);
   ok('a deleted role is recreated under a new id', [s2.made, !!guild.roles.cache.get(idOf('medic'))], [['medic'], true]);
 
+  // The echo of our own write is not a manual change: looked at again later.
+  {
+    const slow = new RolesMirror(roles, store, { isOn: () => true, log, echoWindowMs: 150 });
+    roles.apply('', '200', 'trait.add', 'medic');
+    await slow.afterApply(guild, ['200']);
+    guild.writes.length = 0;
+    two.roles.cache.delete(idOf('medic'));
+    await slow.onMemberUpdate(two);
+    ok('inside the window nothing is written yet', guild.writes.length, 0);
+    await new Promise((r) => setTimeout(r, 250));
+    ok('after the window the drift is put back', [guild.writes.length, two.roles.cache.has(idOf('medic'))], [1, true]);
+    roles.apply('', '200', 'trait.remove', 'medic');
+    await mirror.afterApply(guild, ['200']);
+  }
+
   // The sweep finds nothing after all that.
   const sw = await mirror.reconcileAll(guild, 'sweep');
   ok('the sweep is quiet when the guild matches', [sw.checked, sw.fixed, sw.failed], [2, 0, 0]);
@@ -387,7 +409,7 @@ console.log('import');
   // Two factions at once: neither is taken, the rest still comes.
   guild.addMember('d-333', [id('loner'), id('duty'), id('freedom'), id('stalker-experienced')]);
 
-  const mirror = new RolesMirror(rl, st, { isOn: () => false, log });
+  const mirror = new RolesMirror(rl, st, { isOn: () => false, log, echoWindowMs: 0 });
   logged.length = 0;
   const imp = await mirror.importIfNeeded(guild);
   ok('the import ran once', [imp.done, imp.members], [true, 3]);

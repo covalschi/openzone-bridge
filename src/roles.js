@@ -410,6 +410,15 @@ export class Roles {
       if (limit !== undefined && limit !== null) next.limit = Math.max(0, Math.floor(Number(limit) || 0));
       this.store.factionSet(next);
 
+      // The leader post named after the faction follows a rename, so "Лідер:
+      // renegade" does not outlive the faction being called Ренегати
+      // (measured on the stand 2026-09-03). A post the admin named by hand
+      // keeps its name.
+      const lead = had.posts.find((p) => p.slug === 'leader');
+      if (lead && name && name !== had.label && lead.label === 'Лідер: ' + had.label) {
+        this.store.postSet({ ...lead, label: 'Лідер: ' + name });
+      }
+
       if (hasLeader !== undefined && hasLeader !== null && !had.base) {
         const post = had.posts.find((p) => p.slug === 'leader');
         if (hasLeader && !post) {
@@ -545,7 +554,13 @@ export class Roles {
     const node = { ...e.node, label: trimmed };
     if (e.kind === 'rank') this.store.rankSet(node);
     else if (e.kind === 'trait') this.store.traitSet(node);
-    else if (e.kind === 'faction') this.store.factionSet(node);
+    else if (e.kind === 'faction') {
+      this.store.factionSet(node);
+      // The same rule as upsertFaction: a leader post named after the
+      // faction is renamed with it.
+      const lead = e.node.posts.find((p) => p.slug === 'leader');
+      if (lead && lead.label === 'Лідер: ' + was) this.store.postSet({ ...lead, label: 'Лідер: ' + trimmed });
+    }
     else if (e.kind === 'post') this.store.postSet(node);
     else if (e.kind === 'facrank') this.store.frankSet(node);
     this.#bump();

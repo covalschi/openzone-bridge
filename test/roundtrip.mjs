@@ -62,7 +62,11 @@ const batch = await fetch(BASE + '/v1/poll', {
 }).then((r) => r.json());
 const held = Date.now() - t0;
 
-const lines = batch.Items.map((i) => JSON.parse(i.Json));
+// CHAT lines only: a fresh server id is also handed the roster and the role
+// projections in the same batch, and those carry no Uid (measured 2026-09-03:
+// a bridge restart before the run put four roster parts in the batch and the
+// "both members" set counted an undefined third member).
+const lines = batch.Items.filter((i) => i.Kind === 'chat').map((i) => JSON.parse(i.Json));
 ok('poll returned the message', lines.some((l) => l.Text.includes(probe)), `${held} ms, ${batch.Items.length} item(s)`);
 ok('it is addressed to both members', new Set(lines.map((l) => l.Uid)).size === 2);
 

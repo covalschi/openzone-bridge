@@ -18,12 +18,23 @@
 // logged; the row was already written before the mirror was asked.
 
 export class RolesMirror {
-  constructor(roles, store, { isOn = () => false, log = console } = {}) {
+  constructor(roles, store, { isOn = () => false, log = console, echoWindowMs = 3000 } = {}) {
     this.roles = roles;
     this.store = store;
     this.isOn = isOn;
     this.log = log;
     this.busy = false;
+
+    // When we last wrote each member's roles ourselves. The gateway echoes
+    // our own PATCH back as a member update, and two quick writes to one
+    // member (a leadership handed over and back, measured 2026-09-03) make
+    // the FIRST echo arrive after the SECOND row change -- which reads as
+    // drift and was reverted with a log line blaming a hand that was ours.
+    // A member update inside this window after our own write is looked at
+    // again a moment later instead of acted on at once.
+    this.echoWindowMs = echoWindowMs;
+    this.wrote = new Map();
+    this.recheck = new Set();
   }
 
   on() {
@@ -160,18 +171,6 @@ export class RolesMirror {
     }
   }
 
-  async renameRole(guild, roleId, name) {
-    if (!this.on() || !guild || !roleId) return { ok: true };
-    const role = guild.roles.cache.get(roleId);
-    if (!role) return { ok: true };
-    try {
-      await role.setName(String(name), 'OpenZone roster rename');
-      return { ok: true };
-    } catch (err) {
-      return { ok: false, why: whyDiscordSaidNo(err) };
-    }
-  }
-
   // ---- members in the guild ----------------------------------------------
 
   // Set one linked member's roles to what his row says. One PATCH with the
@@ -193,6 +192,7 @@ export class RolesMirror {
 
     try {
       await member.roles.set(final, 'OpenZone: ' + reason);
+      this.wrote.set(uid, Date.now());
       return 'set';
     } catch (err) {
       this.log.warn(`[roles] cannot set the roles of ${member.user?.tag || uid}: ${whyDiscordSaidNo(err)}`);
@@ -238,6 +238,20 @@ export class RolesMirror {
     const extra = [...current].filter((id) => managed.has(id) && !desired.has(id));
     const lacking = [...desired].filter((id) => !current.has(id));
     if (!extra.length && !lacking.length) return;
+
+    // Possibly the echo of our own write: look again once the echoes have
+    // had time to land, and only once per member at a time.
+    const at = this.wrote.get(uid) || 0;
+    if (this.echoWindowMs > 0 && Date.now() - at < this.echoWindowMs) {
+      if (this.recheck.has(uid)) return;
+      this.recheck.add(uid);
+      setTimeout(() => {
+        this.recheck.delete(uid);
+        const fresh = member.guild.members.cache.get(member.id);
+        if (fresh) this.onMemberUpdate(fresh).catch((e) => this.log.warn(`[roles] recheck failed: ${e.message}`));
+      }, this.echoWindowMs).unref?.();
+      return;
+    }
 
     const name = (id) => member.guild.roles.cache.get(id)?.name || id;
     const what = [...extra.map((id) => '-' + name(id)), ...lacking.map((id) => '+' + name(id))].join(', ');

@@ -910,10 +910,17 @@ export class DiscordSide {
         await i.editReply({ content: r.why });
         return;
       }
+      // The guild follows through the ordinary catalog sync: it renames the
+      // role itself and, for a faction, the leader post named after it.
       let tail = '';
-      if (this.rolesMirror) {
-        const m = await this.rolesMirror.renameRole(i.guild, r.roleId, r.now);
-        if (!m.ok) tail = ` (the Discord role kept its name: ${m.why})`;
+      if (this.rolesMirror && this.rolesMirror.on()) {
+        try {
+          await this.rolesMirror.afterCatalog(i.guild, { touched: [], dropRoleIds: [] }, 'rename from Discord');
+        } catch (e) {
+          tail = ` (the Discord role kept its name: ${e.message})`;
+        }
+      } else {
+        tail = ' (The roles mirror is off, so the Discord role kept its name.)';
       }
       await i.editReply({ content: `Renamed \`${i.options.getString('slug')}\`: **${r.was}** -> **${r.now}**${tail}` });
       return;
